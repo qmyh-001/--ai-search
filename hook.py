@@ -96,8 +96,61 @@ def _patch_manifest(toolchain):
           % (MARK, target))
 
 
+#: Java 助手在仓库里的位置（相对本文件）
+JAVA_REL = os.path.join('java', 'com', 'fojiaoai', 'fojiaoaisearch',
+                        'ProjectionCallback.java')
+
+#: 它在 dist 的 Gradle 工程里应放的位置（src/main/java 是默认源码目录）
+JAVA_DEST_REL = os.path.join('com', 'fojiaoai', 'fojiaoaisearch',
+                             'ProjectionCallback.java')
+
+
+def _gradle_java_root(toolchain):
+    """找到 dist 里 Gradle 工程的 src/main/java 目录。"""
+    candidates = [os.path.join(os.getcwd(), 'src', 'main', 'java')]
+    try:
+        candidates.append(os.path.join(toolchain.dist.dist_dir,
+                                       'src', 'main', 'java'))
+    except Exception:
+        pass
+    for p in candidates:
+        if os.path.isdir(p):
+            return p
+    return None
+
+
+def _install_java(toolchain):
+    """把 ProjectionCallback.java 放进 Gradle 源码目录，让它是编译进 APK。
+
+    为什么不走 buildozer.spec 的 android.add_src：改 spec 会让 CI 的
+    .buildozer 缓存失效（构建从 3~8 分钟变成 30~50 分钟）。而 Gradle 工程
+    本来就有标准的 src/main/java 源码目录，直接把文件写进去同样会被编译。
+
+    没有这个类，Android 14+ 上就注册不了 MediaProjection 回调 —— 表现是
+    虚拟显示 state=ON 但一帧都收不到，所以这里缺文件必须让构建失败。
+    """
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), JAVA_REL)
+    if not os.path.exists(src):
+        raise RuntimeError('[hook] 找不到 Java 助手源码：%s' % src)
+
+    root = _gradle_java_root(toolchain)
+    if root is None:
+        raise RuntimeError(
+            '[hook] 找不到 Gradle 源码目录 src/main/java（工作目录 %s）——'
+            '构建已中止，避免产出一个截不了屏的包' % os.getcwd())
+
+    dest = os.path.join(root, JAVA_DEST_REL)
+    if not os.path.isdir(os.path.dirname(dest)):
+        os.makedirs(os.path.dirname(dest))
+    with io.open(src, encoding='utf-8') as f:
+        text = f.read()
+    io.open(dest, 'w', encoding='utf-8').write(text)
+    print('[hook] 已安装 Java 回调助手 -> %s' % dest)
+
+
 def before_apk_build(toolchain):
     """p4a 钩子入口：APK 构建前（清单生成前）执行。"""
     print('[hook] before_apk_build 开始')
     _patch_manifest(toolchain)
+    _install_java(toolchain)
     print('[hook] before_apk_build 完成')

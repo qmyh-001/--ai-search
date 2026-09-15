@@ -141,10 +141,26 @@ if ANDROID:
             return True
 
 
-    class _PJCallback(PythonJavaClass):
-        """MediaProjection 回调：Android 14 起要求先注册回调才能创建虚拟屏；
-        系统回收授权（锁屏、切换用户等）时也会回调 onStop。"""
-        __javainterfaces__ = ['android/media/projection/MediaProjection$Callback']
+    #: Java 助手（hook.py 在构建时把它编译进 APK，见 java/ProjectionCallback.java）
+    #: autoclass 用点号形式；__javainterfaces__ 用斜杠形式（jnius 的惯例）
+    _CB_CLASS = 'com.fojiaoai.fojiaoaisearch.ProjectionCallback'
+    _CB_LISTENER = 'com/fojiaoai/fojiaoaisearch/ProjectionCallback$Listener'
+
+    class _StopListener(PythonJavaClass):
+        """Java 助手 ProjectionCallback.Listener 的 Python 实现。
+
+        为什么绕这一圈：Android 14+ 把 MediaProjection.Callback 从接口改成了
+        抽象类，而 jnius 的 PythonJavaClass 内部用 java.lang.reflect.Proxy，
+        只能实现接口、不能子类化抽象类 —— 所以 Python 侧直接实现它是做不到的
+        （老代码 _PJCallback 把它当接口声明，构造时必然抛异常被吞掉）。
+        Java 侧 ProjectionCallback 继承 Callback、把 onStop 转发到这个接口上，
+        而接口 jnius 是能实现的。
+
+        这个回调不是可选项：Android 14+ 要求 createVirtualDisplay() 之前必须
+        注册回调，否则系统不往 ImageReader 送帧（表现为虚拟显示 state=ON、
+        投影也持有，却一帧都收不到）。
+        """
+        __javainterfaces__ = [_CB_LISTENER]
         __javacontext__ = 'app'
 
         def __init__(self, on_stop):
@@ -152,7 +168,7 @@ if ANDROID:
             self._on_stop = on_stop
 
         @java_method('()V')
-        def onStop(self):
+        def onProjectionStop(self):
             try:
                 self._on_stop()
             except Exception:
@@ -180,6 +196,14 @@ class AndroidBridge(object):
         self._edit = None
         self._proxies = []          # 持有 Java 代理对象引用，防 GC
         self._projection = None
+        self._reader = None         # 常驻的截屏 ImageReader
+        self._vd = None             # 常驻的 VirtualDisplay
+        self._reader_size = (0, 0)
+        #: 本次授权是否已经尝试过建会话。Android 14+ 上一个 MediaProjection
+        #: 只能成功调用一次 createVirtualDisplay()，所以绝不允许重试建第二个。
+        self._session_attempted = False
+        #: MediaProjection.Callback（Java 助手实例），在主线程造好后复用
+        self._proj_cb = None
         self._mpm = None
         self._service_cls = None
         self._busy = False
@@ -239,7 +263,15 @@ class AndroidBridge(object):
         # p4a 的观察者模式： onActivityResult 转发到 python 回调
         self._mpm = cast('android.media.projection.MediaProjectionManager',
                          activity.getSystemService(Context.MEDIA_PROJECTION_SERVICE))
+        # 必须先解绑：p4a 的 bind() 不去重，每次调用都会新建一个
+        # ActivityResultListener 注册到 Java 侧。重复点「开启截屏授权」会累积
+        # 监听器，导致一次授权结果触发 N 次 _on_activity_result、并发调用
+        # getMediaProjection()。Android 14+ 上后建的投影会停掉前一个，
+        # 竞争赋值下 self._projection 可能停在已失效的那个上 → 截屏拿不到帧。
+        _android_activity.unbind(on_activity_result=self._on_activity_result)
         _android_activity.bind(on_activity_result=self._on_activity_result)
+        # 回调对象在主线程造好（见 _make_projection_callback 的说明）
+        self._make_projection_callback()
         activity.startActivityForResult(self._mpm.createScreenCaptureIntent(),
                                         self.REQUEST_CODE)
 
@@ -257,22 +289,12 @@ class AndroidBridge(object):
             self._start_capture_service()
         except Exception:
             traceback.print_exc()
-        cb = None
-        try:
-            cb = _PJCallback(self._on_projection_stopped)
-            self._proxies.append(cb)
-        except Exception:
-            # Android 14 起 MediaProjection.Callback 从接口改成了抽象类，
-            # jnius 无法用 PythonJavaClass 实现它。该回调只用于感知
-            # "授权被系统回收"，不是截屏必需，跳过即可。
-            from kivy.logger import Logger
-            Logger.info('[fojiao] 跳过 MediaProjection 回调'
-                        '（Android 14+ 已改为抽象类）')
         # 【工作线程】前台服务是异步起来的（p4a 的服务要先启动一个
         # Python 解释器，实测 1 秒以上才调 startForeground），
         # 所以轮询重试直到就绪，再取 MediaProjection。
+        # （回调对象已在 _request_projection_ui 里、于主线程造好。）
         threading.Thread(target=self._wait_projection,
-                         args=(resultCode, data, cb), daemon=True).start()
+                         args=(resultCode, data), daemon=True).start()
 
     #: p4a 按 buildozer.spec 里的 services = medcap:... 生成的 Java 服务类
     SERVICE_CLASS = 'com.fojiaoai.fojiaoaisearch.ServiceMedcap'
@@ -290,7 +312,7 @@ class AndroidBridge(object):
         self._service_cls.start(activity, '')
         return True
 
-    def _wait_projection(self, resultCode, data, cb):
+    def _wait_projection(self, resultCode, data):
         """等前台服务就绪后取 MediaProjection。
 
         p4a 的服务跑在独立进程里，要先启动一个 Python 解释器才调用
@@ -321,15 +343,53 @@ class AndroidBridge(object):
                 '再点它读图搜题。' % err)
             return
         self._projection = proj
-        if cb is not None:
+        # Android 14+ 必须先注册回调、再 createVirtualDisplay()，否则系统
+        # 不往 ImageReader 送帧。两者都派发到主线程执行，先后有保证。
+        self._register_projection_callback(proj)
+        # 授权成功就把常驻截屏会话建好（一次就够，之后一直复用），
+        # 并直接弹出悬浮球 —— 省掉"回 App 点③再切回来"这一圈。
+        self._session_attempted = False
+        self.start_capture_session()
+        if self.has_overlay_permission():
             try:
-                proj.registerCallback(cb, None)
+                self.show_ball()
             except Exception:
-                Logger.info('[fojiao] 注册回调失败，忽略')
-        self.toast('截屏授权成功，可以切到刷题App使用了')
+                traceback.print_exc()
+        self.toast('截屏授权成功，悬浮球已就绪，去刷题吧')
+
+    def _make_projection_callback(self):
+        """(主线程) 造一个 MediaProjection.Callback 实例。
+
+        必须在这条主线程上造：jnius 解析"应用自己的类"要用应用类加载器，
+        在 threading.Thread 这种附加线程上会走系统类加载器而找不到。
+        """
+        if self._proj_cb is not None:
+            return self._proj_cb
+        listener = _StopListener(self._on_projection_stopped)
+        self._proxies.append(listener)
+        helper = autoclass(_CB_CLASS)(listener)
+        self._proxies.append(helper)
+        self._proj_cb = helper
+        return helper
+
+    @run_on_ui_thread
+    def _register_projection_callback(self, proj):
+        try:
+            if self._proj_cb is None:
+                self._make_projection_callback()
+            proj.registerCallback(self._proj_cb, None)
+            from kivy.logger import Logger
+            Logger.info('[fojiao] 已注册 MediaProjection 回调'
+                        '（Android 14+ 缺它系统就不送帧）')
+        except Exception:
+            traceback.print_exc()
 
     def _on_projection_stopped(self):
         self._projection = None
+        # 截屏会话是跟着投影走的：投影没了会话也作废，重建要等下次授权
+        self._ui_call(self._release_capture_session)
+        self._session_attempted = False
+        self._proj_cb = None
         self._set_answer('注意：截屏授权已被系统回收（锁屏或切后台会触发），'
                          '请回到「佛脚AI搜题」重新点一次「② 开启截屏授权」。')
 
@@ -723,8 +783,12 @@ class AndroidBridge(object):
             except Exception:
                 traceback.print_exc()
             if not src:
-                # 没找到：多半是首次使用缺权限，请求一次并提示
-                self.ensure_media_permission()
+                # 没找到：多半是首次使用缺权限，请求一次并提示。
+                # 必须走主线程：p4a 的 request_permissions 内部会
+                # autoclass('...PythonActivity$PermissionsCallback')，在
+                # threading.Thread 上走的是系统类加载器 → ClassNotFoundException，
+                # 弹窗根本不会出现（实测报 DexPathList[[directory "."]]）。
+                self._ui_call(self.ensure_media_permission)
                 self._set_answer(
                     '没找到截图。\n\n'
                     '用法：先按手机的截图快捷键（一般是电源键+音量下，'
@@ -732,17 +796,17 @@ class AndroidBridge(object):
                     '如果这是第一次用：请在系统弹窗里允许读取图片，'
                     '然后重新点一次。')
                 return
-            dst = os.path.join(str(activity.getCacheDir()), 'latest_shot.jpg')
+            # jnius 对象的 str() 是对象表示，不是路径，必须取绝对路径
+            dst = os.path.join(activity.getCacheDir().getAbsolutePath(),
+                               'latest_shot.jpg')
             self._prepare_image(src, dst)
-            self._set_answer('已读到截图：%s\n\n正在识别题目…'
-                             % os.path.basename(src))
+            self._set_answer('已读到截图，正在识别题目…')
             q = ai_core.ocr_question(dst)
-            self._set_answer('【题目】\n' + ai_core.font_safe(q) +
-                             '\n\n正在解答…')
+            self._set_answer('已识别题目，正在解答…')
             answer = ai_core.solve_question(q)
             self._last_answer = answer
-            self._set_answer('【题目】\n' + ai_core.font_safe(q) +
-                             '\n\n【解答】\n' + ai_core.plain_text(answer))
+            # 同截图搜题：题目不用重复贴，只回答案
+            self._set_answer('【解答】\n' + ai_core.plain_text(answer))
         except Exception as e:
             traceback.print_exc()
             self._set_answer('错误：' + str(e))
@@ -810,20 +874,20 @@ class AndroidBridge(object):
         self.show_panel('正在截图…')
         self._ball_visible_ui(False)
         self._panel_visible_ui(False)
-        path = os.path.join(str(activity.getCacheDir()), 'fojiao_shot.jpg')
+        # jnius 对象的 str() 是对象表示，不是路径，必须取绝对路径
+        path = os.path.join(activity.getCacheDir().getAbsolutePath(),
+                            'fojiao_shot.jpg')
 
         def worker():
             try:
                 self._do_capture(path)
                 self._set_answer('正在识别题目…')
                 q = ai_core.ocr_question(path)
-                self._set_answer('识别到题目：\n' + ai_core.font_safe(q) +
-                                 '\n\n正在解答…')
+                self._set_answer('已识别题目，正在解答…')
                 answer = ai_core.solve_question(q)
                 self._last_answer = answer
-                self._set_answer('【题目】\n' + ai_core.font_safe(q) +
-                                 '\n\n【解答】\n' +
-                                 ai_core.plain_text(answer))
+                # 题目就在屏幕上看着，面板又小，只回答案不重复贴题目
+                self._set_answer('【解答】\n' + ai_core.plain_text(answer))
             except Exception as e:
                 traceback.print_exc()
                 self._set_answer('错误：' + str(e))
@@ -834,6 +898,51 @@ class AndroidBridge(object):
         threading.Thread(target=worker, daemon=True).start()
 
     # ---------------- MediaProjection 截屏 ----------------
+    def _release_capture_session(self):
+        """(主线程) 关掉常驻的 reader / virtual display。"""
+        for attr in ('_vd', '_reader'):
+            obj = getattr(self, attr, None)
+            if obj is None:
+                continue
+            try:
+                obj.close()
+            except Exception:
+                try:
+                    obj.release()
+                except Exception:
+                    pass
+            setattr(self, attr, None)
+        self._reader_size = (0, 0)
+
+    def _create_capture_session(self):
+        """(必须主线程) 建常驻的 ImageReader + VirtualDisplay。
+
+        **每个 MediaProjection 只能建一次，建成后一直复用、绝不重建。**
+        Android 14+ 上 createVirtualDisplay() 对同一个投影实例只允许成功
+        调用一次；关掉再建是无效的 —— 实测反复重建的后果就是"前几次一帧
+        都收不到、某次偶然拿到帧但那是刚建会话时的黑帧"。
+        """
+        if self._session_attempted:
+            return
+        self._session_attempted = True
+        self._release_capture_session()
+        sw, sh = self._screen()
+        self._reader = ImageReader.newInstance(sw, sh, PixelFormat.RGBA_8888, 2)
+        self._vd = self._projection.createVirtualDisplay(
+            'fojiao-cap', sw, sh, self._dpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            self._reader.getSurface(), None, None)
+        self._reader_size = (sw, sh)
+        from kivy.logger import Logger
+        Logger.info('[fojiao] 截屏会话已建立 %dx%d（此后一直复用）' % (sw, sh))
+
+    @run_on_ui_thread
+    def start_capture_session(self):
+        try:
+            self._create_capture_session()
+        except Exception:
+            traceback.print_exc()
+
     def _do_capture(self, path):
         result = {}
         done = threading.Event()
@@ -841,22 +950,43 @@ class AndroidBridge(object):
         @run_on_ui_thread
         def start():
             try:
-                sw, sh = self._screen()
-                reader = ImageReader.newInstance(sw, sh, PixelFormat.RGBA_8888, 2)
-                vd = self._projection.createVirtualDisplay(
-                    'fojiao-cap', sw, sh, self._dpi,
-                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                    reader.getSurface(), None, None)
+                # 会话只在授权时建一次（见 _create_capture_session）；
+                # 这里只兜底，且绝不重试建第二个。
+                if self._reader is None and not self._session_attempted:
+                    self._create_capture_session()
+                reader = self._reader
+                sw, sh = self._reader_size
+                if reader is None:
+                    result['err'] = '截屏会话没建起来，请重新点「② 开启截屏授权」'
+                    done.set()
+                    return
 
                 def read():
                     try:
-                        time.sleep(0.35)
-                        img = reader.acquireLatestImage()
+                        # 等"隐藏悬浮球"进入新帧，并把积压的旧帧全部丢掉、
+                        # 只留最后一帧 —— 否则可能截到球，或截到刚建会话时的黑帧
+                        time.sleep(0.6)
+                        img = None
+                        t0 = time.time()
+                        while time.time() - t0 < 0.6:
+                            nxt = reader.acquireLatestImage()
+                            if nxt is None:
+                                time.sleep(0.05)
+                                continue
+                            if img is not None:
+                                img.close()
+                            img = nxt
+                        # 一帧都还没有（会话刚建好时正常），再多等一会儿
                         if img is None:
-                            time.sleep(0.25)
-                            img = reader.acquireLatestImage()
+                            t0 = time.time()
+                            while img is None and time.time() - t0 < 5.0:
+                                time.sleep(0.1)
+                                img = reader.acquireLatestImage()
                         if img is None:
-                            raise RuntimeError('未捕获到屏幕画面')
+                            raise RuntimeError(
+                                '没收到屏幕画面（虚拟显示 %dx%d）。'
+                                '截屏会话可能已被系统回收，'
+                                '请重新点「② 开启截屏授权」' % (sw, sh))
                         plane = img.getPlanes()[0]
                         row = plane.getRowStride()
                         pix = plane.getPixelStride()
@@ -882,14 +1012,7 @@ class AndroidBridge(object):
                     except Exception as e:
                         result['err'] = str(e)
                     finally:
-                        for x in (vd, reader):
-                            try:
-                                x.close()
-                            except Exception:
-                                try:
-                                    x.release()
-                                except Exception:
-                                    pass
+                        # 这里不能关 reader/vd —— 会话要留给下一次截图用
                         done.set()
                 threading.Thread(target=read, daemon=True).start()
             except Exception as e:
@@ -900,8 +1023,9 @@ class AndroidBridge(object):
         done.wait(15)
         if result.get('ok'):
             return True
-        # 授权可能已被系统回收，作废掉，让状态页如实提示需要重新授权
-        self._projection = None
+        # 千万别在这里关掉会话：Android 14+ 上一个 MediaProjection 只能成功
+        # 建一次 VirtualDisplay，关掉就再也建不回来（实测反复重建的结果是
+        # 一帧都收不到）。会话留给下一次截图继续用。
         raise RuntimeError('截图失败：' + result.get('err', '超时'))
 
 

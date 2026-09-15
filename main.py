@@ -576,15 +576,24 @@ class FojiaoApp(App):
             bridge.hide_ball()
 
     def test_api(self):
-        self.popup('测试中…', '正在请求 DeepSeek 接口…')
+        # 必须留住这个弹窗的引用才能关掉它：之前直接丢弃返回值，
+        # 结果「测试中…」永远留在屏幕上，按返回键关掉结果弹窗后
+        # 底下露出来的就是它，看起来像卡在"正在请求接口"。
+        busy = self.popup('测试中…', '正在请求 DeepSeek 接口…')
+
+        def done(msg):
+            try:
+                busy.dismiss()
+            except Exception:
+                pass
+            self.popup('API 测试', msg)
 
         def worker():
             try:
                 msg = ai_core.test_connection()
             except Exception as e:
                 msg = '错误： ' + str(e)
-            Clock.schedule_once(
-                lambda dt: self.popup('API 测试', msg), 0)
+            Clock.schedule_once(lambda dt: done(msg), 0)
         threading.Thread(target=worker, daemon=True).start()
 
     # ---------- 桌面调试 ----------

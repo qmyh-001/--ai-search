@@ -13,6 +13,7 @@ import base64
 import json
 import os
 import re
+import ssl
 import urllib.error
 import urllib.request
 
@@ -26,7 +27,25 @@ try:
     os.environ.setdefault('SSL_CERT_FILE', _CA_BUNDLE)
     os.environ.setdefault('REQUESTS_CA_BUNDLE', _CA_BUNDLE)
 except Exception:
-    pass
+    _CA_BUNDLE = None
+
+
+def _ssl_context():
+    """HTTPS 请求用的 SSL 上下文。
+
+    Android 上 p4a 打包的 OpenSSL **不认 SSL_CERT_FILE**：实测
+    create_default_context() 出来的信任库是空的（cert_store_stats 全 0），
+    校验就直接死在 "self signed certificate in certificate chain"。
+    光设环境变量没用，必须显式把 certifi 的证书包加载进上下文
+    （加载后是 121 把 CA）。
+    """
+    ctx = ssl.create_default_context()
+    if _CA_BUNDLE:
+        try:
+            ctx.load_verify_locations(cafile=_CA_BUNDLE)
+        except Exception:
+            pass
+    return ctx
 
 cfg = {
     'api_key': '',
@@ -195,7 +214,8 @@ def _post_chat(model, messages, timeout=180, think=None):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout,
+                                    context=_ssl_context()) as r:
             data = json.loads(r.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
         detail = ''
@@ -265,7 +285,8 @@ def list_models():
     req = urllib.request.Request(
         url, headers={'Authorization': 'Bearer ' + cfg['api_key']})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=30,
+                                    context=_ssl_context()) as r:
             data = json.loads(r.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
         detail = ''
