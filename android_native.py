@@ -24,6 +24,8 @@ try:
     PythonActivity = autoclass('org.kivy.android.PythonActivity')
     activity = PythonActivity.mActivity
 
+    JString = autoclass('java.lang.String')
+
     Context = autoclass('android.content.Context')
     Intent = autoclass('android.content.Intent')
     Uri = autoclass('android.net.Uri')
@@ -55,6 +57,19 @@ except Exception:  # 桌面调试
 def _c(v):
     """把 0xAARRGGBB 压成 Java int（有符号）。"""
     return v - 0x100000000 if v > 0x7FFFFFFF else v
+
+
+def _s(text):
+    """把 Python 字符串转成 java.lang.String。
+
+    pyjnius 只会自动转换声明为 String 的参数，对声明为 CharSequence 的
+    参数不做转换——直接传 str 会抛 JavaException: No methods called
+    setText ... matching your arguments。setText/setHint/Toast.makeText/
+    ClipData.newPlainText 都吃 CharSequence，必须用这个包一层。
+    """
+    if not ANDROID:
+        return text
+    return JString(text)
 
 
 def _argb(a, r, g, b):
@@ -184,7 +199,7 @@ class AndroidBridge(object):
     @run_on_ui_thread
     def _toast_ui(self, msg):
         try:
-            Toast.makeText(activity, msg, Toast.LENGTH_SHORT).show()
+            Toast.makeText(activity, _s(msg), Toast.LENGTH_SHORT).show()
         except Exception:
             traceback.print_exc()
 
@@ -246,7 +261,7 @@ class AndroidBridge(object):
 
     def _on_projection_stopped(self):
         self._projection = None
-        self._set_answer('⚠️ 截屏授权已被系统回收（锁屏或切后台会触发），'
+        self._set_answer('注意：截屏授权已被系统回收（锁屏或切后台会触发），'
                          '请回到「佛脚AI搜题」重新点一次「② 开启截屏授权」。')
 
     # ---------------- 悬浮球 ----------------
@@ -269,7 +284,7 @@ class AndroidBridge(object):
         gd.setColor(_argb(235, 37, 99, 235))
         gd.setStroke(self._dp(2), _argb(255, 255, 255, 255))
         b.setBackground(gd)
-        b.setText('搜')
+        b.setText(_s('搜'))
         b.setTextColor(_argb(255, 255, 255, 255))
         b.setTextSize(20.0)
         lp = WMLP(size, size, WMLP.TYPE_APPLICATION_OVERLAY,
@@ -342,7 +357,7 @@ class AndroidBridge(object):
         if self._panel is not None:
             self._panel.setVisibility(View.VISIBLE)
         if text and self._answer_tv is not None:
-            self._answer_tv.setText(text)
+            self._answer_tv.setText(_s(text))
 
     def _build_panel(self):
         sw, sh = self._screen()
@@ -360,12 +375,12 @@ class AndroidBridge(object):
         title = LinearLayout(activity)
         title.setOrientation(LinearLayout.HORIZONTAL)
         tv = TextView(activity)
-        tv.setText('AI 解题')
+        tv.setText(_s('AI 解题'))
         tv.setTextColor(_argb(255, 147, 197, 253))
         tv.setTextSize(15.0)
         title.addView(tv, LLLP(0, -2, 1.0))
         btn_min = self._small_btn('—')
-        btn_close = self._small_btn('✕')
+        btn_close = self._small_btn('×')
         title.addView(btn_min, LLLP(-2, -2))
         title.addView(btn_close, LLLP(-2, -2))
         root.addView(title, LLLP(-1, -2))
@@ -384,12 +399,12 @@ class AndroidBridge(object):
         row = LinearLayout(activity)
         row.setOrientation(LinearLayout.HORIZONTAL)
         edit = EditText(activity)
-        edit.setHint('点这里输入/粘贴题目')
+        edit.setHint(_s('点这里输入/粘贴题目'))
         edit.setTextColor(_argb(255, 255, 255, 255))
         edit.setHintTextColor(_argb(170, 156, 163, 175))
         edit.setTextSize(13.0)
         edit.setMaxLines(3)
-        btn_kbd = self._small_btn('⌨')
+        btn_kbd = self._small_btn('键盘')
         btn_send = self._small_btn('问')
         row.addView(edit, LLLP(0, -2, 1.0))
         row.addView(btn_kbd, LLLP(-2, -2))
@@ -467,7 +482,7 @@ class AndroidBridge(object):
                 if not text:
                     self.toast('剪贴板为空或无权限读取，请长按输入框手动粘贴')
                     return
-                self._ui_call(lambda: edit.setText(text))
+                self._ui_call(lambda: edit.setText(_s(text)))
                 self.solve_text_async(text)
             threading.Thread(target=worker, daemon=True).start()
 
@@ -504,7 +519,7 @@ class AndroidBridge(object):
 
     def _small_btn(self, text):
         b = Button(activity)
-        b.setText(text)
+        b.setText(_s(text))
         b.setTextColor(_argb(255, 147, 197, 253))
         b.setTextSize(12.0)
         b.setPadding(self._dp(8), self._dp(2), self._dp(8), self._dp(2))
@@ -519,7 +534,7 @@ class AndroidBridge(object):
     @run_on_ui_thread
     def _set_answer_ui(self, text):
         if self._answer_tv is not None:
-            self._answer_tv.setText(text)
+            self._answer_tv.setText(_s(text))
 
     # ---------------- 剪贴板 ----------------
     def get_clipboard(self):
@@ -539,7 +554,7 @@ class AndroidBridge(object):
                 cm = cast('android.content.ClipboardManager',
                           activity.getSystemService(Context.CLIPBOARD_SERVICE))
                 ClipData = autoclass('android.content.ClipData')
-                cm.setPrimaryClip(ClipData.newPlainText('answer', text))
+                cm.setPrimaryClip(ClipData.newPlainText(_s('answer'), _s(text)))
             except Exception:
                 traceback.print_exc()
         self._ui_call(do)
@@ -551,7 +566,7 @@ class AndroidBridge(object):
             text = self.get_clipboard().strip()
             if not text:
                 self.show_panel(
-                    '⚠️ 没有读到剪贴板文字。\n\n'
+                    '注意：没有读到剪贴板文字。\n\n'
                     'Android 10+ 只允许当前获焦的应用读剪贴板。\n'
                     '方法1：在题目界面长按选中题目文字 → 复制，'
                     '再点面板里的【读剪贴板】；\n'
@@ -566,7 +581,7 @@ class AndroidBridge(object):
             self.toast('正在处理上一题，请稍候…')
             return
         self._busy = True
-        self.show_panel('🧠 正在解答…\n\n【题目】\n' + question[:400])
+        self.show_panel('正在解答…\n\n【题目】\n' + question[:400])
 
         def worker():
             try:
@@ -576,7 +591,7 @@ class AndroidBridge(object):
                                  '\n\n【解答】\n' + ai_core.plain_text(answer))
             except Exception as e:
                 traceback.print_exc()
-                self._set_answer('❌ 出错了：' + str(e))
+                self._set_answer('错误：' + str(e))
             finally:
                 self._busy = False
         threading.Thread(target=worker, daemon=True).start()
@@ -589,7 +604,7 @@ class AndroidBridge(object):
             self.toast('请先打开「佛脚AI搜题」完成一次截屏授权')
             return
         self._busy = True
-        self.show_panel('📷 正在截图…')
+        self.show_panel('正在截图…')
         self._ball_visible_ui(False)
         self._panel_visible_ui(False)
         path = os.path.join(str(activity.getCacheDir()), 'fojiao_shot.jpg')
@@ -597,16 +612,16 @@ class AndroidBridge(object):
         def worker():
             try:
                 self._do_capture(path)
-                self._set_answer('🔍 正在识别题目…')
+                self._set_answer('正在识别题目…')
                 q = ai_core.ocr_question(path)
-                self._set_answer('✅ 识别到题目：\n' + q + '\n\n🧠 正在解答…')
+                self._set_answer('识别到题目：\n' + q + '\n\n正在解答…')
                 answer = ai_core.solve_question(q)
                 self._last_answer = answer
                 self._set_answer('【题目】\n' + q +
                                  '\n\n【解答】\n' + ai_core.plain_text(answer))
             except Exception as e:
                 traceback.print_exc()
-                self._set_answer('❌ 出错了：' + str(e))
+                self._set_answer('错误：' + str(e))
             finally:
                 self._busy = False
                 self._ball_visible_ui(True)

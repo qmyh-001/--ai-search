@@ -18,6 +18,7 @@ from kivy.lang import Builder
 from kivy.metrics import sp
 from kivy.properties import StringProperty
 from kivy.storage.jsonstore import JsonStore
+from kivy.core.window import Window
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.screenmanager import Screen, ScreenManager  # noqa: F401 (KV 里用到 ScreenManager)
@@ -32,6 +33,33 @@ except Exception:
     bridge = None
 
 IS_ANDROID = platform == 'android'
+
+FONT_FILE = 'NotoSansSC-Regular.otf'
+
+
+def _register_cjk_font():
+    """Kivy 默认字体 Roboto 不含汉字，会全部显示成方框。
+
+    把打包进 APK 的 Noto Sans SC（覆盖全部常用简体汉字）注册为默认字体，
+    注册名用 'Roboto' 即可让所有控件全局生效。
+    """
+    from kivy.core.text import LabelBase
+
+    candidates = [FONT_FILE]
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates.append(os.path.join(here, FONT_FILE))
+    except Exception:
+        pass
+    for path in candidates:
+        try:
+            if os.path.exists(path):
+                LabelBase.register(name='Roboto', fn_regular=path)
+                return path
+        except Exception:
+            traceback.print_exc()
+    print('警告: 未找到中文字体 %s，汉字可能显示为方框' % FONT_FILE)
+    return None
 
 HELP_TEXT = (
     '【使用步骤】\n'
@@ -89,13 +117,13 @@ KV = '''
             text: '停止悬浮球'
             on_press: app.stop_ball()
         Button:
-            text: '⚙ API 设置'
+            text: 'API 设置'
             on_press: app.sm.current = 'settings'
         Button:
-            text: '📖 使用说明'
+            text: '使用说明'
             on_press: app.sm.current = 'help'
         Button:
-            text: '🔌 测试 API 连通'
+            text: '测试 API 连通'
             on_press: app.test_api()
 
 <SettingsScreen>:
@@ -290,13 +318,39 @@ class FojiaoApp(App):
     title = '佛脚AI搜题'
 
     def build(self):
+        # 必须赶在创建任何控件之前注册中文字体
+        _register_cjk_font()
         self.store = JsonStore(os.path.join(self.user_data_dir, 'settings.json'))
         self.sm = Builder.load_string(KV)
         self.load_settings()
         if not IS_ANDROID:
             self.sm.current = 'desktop'
+        # 接管安卓返回键，否则按返回会直接把应用切到后台
+        Window.bind(on_keyboard=self._on_key)
         Clock.schedule_interval(self.refresh_status, 2)
         return self.sm
+
+    def _on_key(self, window, key, *largs):
+        """拦截安卓返回键（Python 侧表现为 key == 27）。
+
+        Kivy 的默认处理是 mActivity.moveTaskToBack(True)，也就是直接切到
+        后台——用户看到的就是"点进去再按返回，程序退出了"。
+        这里改成：先关弹窗 → 再回主界面 → 只有本来就在主界面才切后台。
+        桌面端不干预。
+        """
+        if not IS_ANDROID or key != 27:
+            return False
+        try:
+            for child in list(Window.children):
+                if isinstance(child, Popup):
+                    child.dismiss()
+                    return True
+        except Exception:
+            traceback.print_exc()
+        if self.sm.current != 'main':
+            self.sm.current = 'main'
+            return True
+        return False
 
     def on_pause(self):
         # 退到后台（去刷题App）时返回 True，让 Activity 保持存活，
@@ -354,16 +408,16 @@ class FojiaoApp(App):
         lines = ['[b]运行状态[/b]']
         if IS_ANDROID and bridge:
             lines.append('悬浮窗权限：%s' % (
-                '[color=00c853]✔ 已授权[/color]' if bridge.has_overlay_permission()
-                else '[color=ff5252]✘ 未授权[/color]'))
+                '[color=00c853]√ 已授权[/color]' if bridge.has_overlay_permission()
+                else '[color=ff5252]× 未授权[/color]'))
             lines.append('截屏授权：%s' % (
-                '[color=00c853]✔ 已持有[/color]' if bridge.has_projection()
+                '[color=00c853]√ 已持有[/color]' if bridge.has_projection()
                 else '[color=ffb300]○ 未授权[/color]'))
         else:
             lines.append('当前：桌面调试模式')
         lines.append('API Key：%s' % (
-            '[color=00c853]✔ 已设置[/color]' if ai_core.cfg['api_key']
-            else '[color=ff5252]✘ 未设置[/color]'))
+            '[color=00c853]√ 已设置[/color]' if ai_core.cfg['api_key']
+            else '[color=ff5252]× 未设置[/color]'))
         lines.append('模型：%s（识图）/ %s（解题）' % (
             ai_core.cfg['vision_model'], ai_core.cfg['solve_model']))
         try:
@@ -410,7 +464,7 @@ class FojiaoApp(App):
             try:
                 msg = ai_core.test_connection()
             except Exception as e:
-                msg = '❌ ' + str(e)
+                msg = '错误： ' + str(e)
             Clock.schedule_once(
                 lambda dt: self.popup('API 测试', msg), 0)
         threading.Thread(target=worker, daemon=True).start()
@@ -442,7 +496,7 @@ class FojiaoApp(App):
                 traceback.print_exc()
                 # 注意：不能在延迟执行的 lambda 里引用 e，
                 # Python 3 会在 except 块结束时删除该名字
-                err = '❌ ' + str(e)
+                err = '错误： ' + str(e)
                 Clock.schedule_once(lambda dt: setattr(
                     dsk.ids.dresult, 'text', err), 0)
         threading.Thread(target=worker, daemon=True).start()

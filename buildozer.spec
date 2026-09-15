@@ -5,7 +5,8 @@ title = 佛脚AI搜题
 package.name = fojiaoaisearch
 package.domain = com.fojiaoai
 source.dir = .
-source.include_exts = py,png,jpg,kv,atlas,json,txt
+# otf/ttf 必须包含，否则中文字体文件不会被打进 APK
+source.include_exts = py,png,jpg,kv,atlas,json,txt,otf,ttf
 version = 1.0.0
 
 # 依赖：android 模块(activity/runnable/permissions)由 SDL2 引导自动提供，无需列出
