@@ -309,9 +309,10 @@ class AndroidBridge(object):
             except Exception:
                 pass
 
-        tl = _OnTouchListener(on_tap=self.ball_tap_default,
-                              on_drag=on_drag, on_down=on_down, on_up=on_up,
-                              slop=self._dp(6))
+        # 注意：pyjnius 的 PythonJavaClass 子类底层是 Cython __cinit__，
+        # 不接受关键字参数，必须按位置传（参数顺序见类的 __init__）
+        tl = _OnTouchListener(self.ball_tap_default, on_drag, on_down, on_up,
+                              self._dp(6))
         self._proxies.append(tl)
         b.setOnTouchListener(tl)
         self._wm.addView(b, lp)
@@ -445,8 +446,8 @@ class AndroidBridge(object):
             except Exception:
                 pass
 
-        tl = _OnTouchListener(on_drag=on_drag, on_down=on_down,
-                              slop=self._dp(8))
+        # 同样必须用位置参数：(on_tap, on_drag, on_down, on_up, slop)
+        tl = _OnTouchListener(None, on_drag, on_down, None, self._dp(8))
         self._proxies.append(tl)
         title.setOnTouchListener(tl)
 
@@ -480,7 +481,9 @@ class AndroidBridge(object):
                 time.sleep(0.25)
                 text = self.get_clipboard().strip()
                 if not text:
-                    self.toast('剪贴板为空或无权限读取，请长按输入框手动粘贴')
+                    self._set_answer('剪贴板为空或读不到（Android 10+ 只允许'
+                                     '获焦应用读剪贴板）。\n\n可长按输入框手动'
+                                     '粘贴，或直接用「截图搜题」。')
                     return
                 self._ui_call(lambda: edit.setText(_s(text)))
                 self.solve_text_async(text)
@@ -489,7 +492,8 @@ class AndroidBridge(object):
         def _send():
             q = str(edit.getText().toString()).strip()
             if not q:
-                self.toast('请先输入题目')
+                self._set_answer('请先在输入框里输入或粘贴题目，'
+                                 '再点「问」。')
                 return
             self.solve_text_async(q)
 
@@ -581,14 +585,15 @@ class AndroidBridge(object):
             self.toast('正在处理上一题，请稍候…')
             return
         self._busy = True
-        self.show_panel('正在解答…\n\n【题目】\n' + question[:400])
+        self.show_panel('正在解答…\n\n【题目】\n' + ai_core.font_safe(question[:400]))
 
         def worker():
             try:
                 answer = ai_core.solve_question(question)
                 self._last_answer = answer
-                self._set_answer('【题目】\n' + question +
-                                 '\n\n【解答】\n' + ai_core.plain_text(answer))
+                self._set_answer('【题目】\n' + ai_core.font_safe(question) +
+                                 '\n\n【解答】\n' +
+                                 ai_core.plain_text(answer))
             except Exception as e:
                 traceback.print_exc()
                 self._set_answer('错误：' + str(e))
@@ -601,7 +606,12 @@ class AndroidBridge(object):
             self.toast('正在处理上一题，请稍候…')
             return
         if self._projection is None:
-            self.toast('请先打开「佛脚AI搜题」完成一次截屏授权')
+            # 注意：App 在后台时系统会拦截 Toast（实测 Android 15 会打日志
+            # "Suppressing toast from package ... by user request"），
+            # 用户什么也看不到。所以这里改用悬浮面板给反馈。
+            self.show_panel('还没有截屏授权。\n\n请回到「佛脚AI搜题」，'
+                            '点「② 开启截屏授权」，在弹出的系统对话框里'
+                            '选「立即开始」，然后再点悬浮球搜题。')
             return
         self._busy = True
         self.show_panel('正在截图…')
@@ -614,11 +624,13 @@ class AndroidBridge(object):
                 self._do_capture(path)
                 self._set_answer('正在识别题目…')
                 q = ai_core.ocr_question(path)
-                self._set_answer('识别到题目：\n' + q + '\n\n正在解答…')
+                self._set_answer('识别到题目：\n' + ai_core.font_safe(q) +
+                                 '\n\n正在解答…')
                 answer = ai_core.solve_question(q)
                 self._last_answer = answer
-                self._set_answer('【题目】\n' + q +
-                                 '\n\n【解答】\n' + ai_core.plain_text(answer))
+                self._set_answer('【题目】\n' + ai_core.font_safe(q) +
+                                 '\n\n【解答】\n' +
+                                 ai_core.plain_text(answer))
             except Exception as e:
                 traceback.print_exc()
                 self._set_answer('错误：' + str(e))

@@ -17,6 +17,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 【关键】缓存 Android SDK/NDK 与已编译好的 Python/Kivy 依赖。
+      # 第一次构建仍然要 30~50 分钟（并在此后写入缓存），
+      # 之后只要 buildozer.spec 没变，改代码后重建只需几分钟。
+      - name: Cache buildozer (SDK/NDK/已编译依赖)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+
+      # 构建时自动下载中文字体（覆盖全部常用简体汉字），
+      # 这样仓库里不必保存 8MB 的二进制字体文件
+      - name: Download CJK font
+        run: |
+          curl -fL -o NotoSansSC-Regular.otf \
+            https://cdn.jsdelivr.net/gh/googlefonts/noto-cjk@main/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf \
+          || curl -fL -o NotoSansSC-Regular.otf \
+            https://raw.githubusercontent.com/googlefonts/noto-cjk/main/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf
+          ls -l NotoSansSC-Regular.otf
+          test -s NotoSansSC-Regular.otf
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
