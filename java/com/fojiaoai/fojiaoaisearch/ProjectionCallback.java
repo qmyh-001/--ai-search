@@ -1,6 +1,6 @@
 package com.fojiaoai.fojiaoaisearch;
 
-import android.media.MediaProjection;
+import android.media.projection.MediaProjection;
 
 /**
  * MediaProjection 回调的 Java 助手。
