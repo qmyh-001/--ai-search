@@ -9,8 +9,16 @@ source.include_exts = py,png,jpg,kv,atlas,json,txt
 version = 1.0.0
 
 # 依赖：android 模块(activity/runnable/permissions)由 SDL2 引导自动提供，无需列出
-# certifi 提供 CA 证书包，否则 Android 上 HTTPS 请求会证书校验失败
+# certifi 提供 CA 证书包（kivy recipe 的 python_depends 里也有，显式列出更清楚）
 requirements = python3,kivy==2.3.0,pyjnius,certifi
+
+# 【关键】把 python-for-android 钉在 v2024.01.21（对应 Python 3.11.5）。
+# 不钉的话 buildozer 默认用 p4a 的 master 分支，而 master 已切到 Python 3.14.2，
+# 其 kivy recipe 却仍把 Cython 限制在 <=3.0.12（Cython 3.0.x 最高只支持 Python 3.12）。
+# 两者冲突会让 kivy 的 Cython 生成的 C 文件编译时满屏报：
+#   error: too few arguments to function call, expected 6, have 5
+#   error: call to undeclared function '_PyInterpreterState_GetConfig'
+p4a.branch = v2024.01.21
 
 # 只打 arm64（iQOO 11 为骁龙8 Gen2，arm64-v8a），加快构建
 android.archs = arm64-v8a
