@@ -70,20 +70,23 @@ def _register_cjk_font():
 EFFORT_VALUE = {'关闭': 'off', '低': 'low', '高': 'high', '最高': 'max'}
 EFFORT_LABEL = {v: k for k, v in EFFORT_VALUE.items()}
 
+# 悬浮球点按动作：界面文字 ↔ bridge 内部取值
+TAP_VALUE = {'截图搜题': 'screenshot', '最新截图': 'shot', '剪贴板搜题': 'clipboard'}
+
 HELP_TEXT = (
     '【使用步骤】\n'
     '1. 到 platform.deepseek.com 注册并创建 API Key，'
     '在「API 设置」里填入（识图用 deepseek-flash，解题用 deepseek-chat，'
     '同一个 Key 即可）。\n\n'
     '2. 点「申请悬浮窗权限」，在系统设置里允许本应用显示在其他应用上层。\n\n'
-    '3. 点「开启截屏授权」，在弹出的系统对话框里操作'
-    '（Android 14/15 会分两步）：\n'
-    '   · 第一步可以下拉把「共享一个应用」改成「共享整个屏幕」，'
-    '也可以保持默认\n'
-    '   · 若保持「共享一个应用」，下一步会让你挑一个App，'
-    '请选佛脚刷题\n'
-    '   · 最后点「开始」/「立即开始」完成授权\n'
-    '   （每次完全退出 App 后需重新授权一次）\n\n'
+    '3. 搜题方式（三选一，可在「API 设置」里改悬浮球点按动作）：\n'
+    '   【最新截图】推荐，最省事：先按手机截图快捷键把题目截图'
+    '（一般是电源键+音量下，或三指下滑），再点悬浮球，'
+    'App 会读相册里最新那张截图去搜题。首次使用需允许读取图片。\n'
+    '   【截图搜题】点悬浮球自动截屏。Android 14 起系统要求截屏'
+    '必须由前台服务承载，本 App 未实现该服务，'
+    '所以点「② 开启截屏授权」可能会失败——失败就改用上面两种。\n'
+    '   【剪贴板搜题】长按选中题目文字 → 复制，再点面板里的【读剪贴板】。\n\n'
     '4. 点「启动悬浮球」回到桌面，打开佛脚刷题，屏幕上会出现蓝色"搜"字悬浮球。\n'
     '   · 点一下悬浮球 = 截图搜题（默认）\n'
     '   · 拖动悬浮球 = 移动位置\n'
@@ -277,7 +280,7 @@ KV = '''
                 Spinner:
                     id: action
                     text: '截图搜题'
-                    values: ['截图搜题', '剪贴板搜题']
+                    values: ['截图搜题', '最新截图', '剪贴板搜题']
                     size_hint_y: None
                     height: dp(40)
         Widget:
@@ -512,9 +515,8 @@ class FojiaoApp(App):
         self.store.put('cfg', **data)
         self.load_settings()
         if bridge:
-            bridge.set_cfg({'tap_action': 'clipboard'
-                            if data['tap_action'] == '剪贴板搜题'
-                            else 'screenshot'})
+            bridge.set_cfg({'tap_action': TAP_VALUE.get(data['tap_action'],
+                                                       'screenshot')})
         self.popup('已保存', '配置已保存。')
 
     # ---------- 状态 ----------
@@ -564,8 +566,8 @@ class FojiaoApp(App):
         if not ai_core.cfg['api_key']:
             self.popup('缺少配置', '请先到「API 设置」填写 DeepSeek API Key')
             return
-        bridge.set_cfg({'tap_action': 'clipboard'
-                        if self._tap_action == '剪贴板搜题' else 'screenshot'})
+        bridge.set_cfg({'tap_action': TAP_VALUE.get(self._tap_action,
+                                                   'screenshot')})
         bridge.show_ball()
         bridge.move_task_to_back()
 

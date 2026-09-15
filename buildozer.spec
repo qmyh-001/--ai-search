@@ -30,7 +30,8 @@ android.api = 33
 android.minapi = 29
 
 # INTERNET 联网；SYSTEM_ALERT_WINDOW 悬浮窗（需用户在系统设置里手动允许）
-android.permissions = android.permission.INTERNET,android.permission.SYSTEM_ALERT_WINDOW
+# READ_MEDIA_IMAGES / READ_EXTERNAL_STORAGE：用于「最新截图」方式读相册里的截图
+android.permissions = android.permission.INTERNET,android.permission.SYSTEM_ALERT_WINDOW,android.permission.READ_MEDIA_IMAGES,android.permission.READ_EXTERNAL_STORAGE
 
 # 自动接受 Android SDK 许可协议。
 # 不设这一项时 sdkmanager 会停下来等待交互输入，导致 build-tools 装不上，

@@ -43,6 +43,7 @@ try:
     Button = autoclass('android.widget.Button')
     GradientDrawable = autoclass('android.graphics.drawable.GradientDrawable')
     Bitmap = autoclass('android.graphics.Bitmap')
+    BitmapFactory = autoclass('android.graphics.BitmapFactory')
     BitmapConfig = autoclass('android.graphics.Bitmap$Config')
     BitmapFormat = autoclass('android.graphics.Bitmap$CompressFormat')
     FileOutputStream = autoclass('java.io.FileOutputStream')
@@ -417,10 +418,10 @@ class AndroidBridge(object):
         row2.setOrientation(LinearLayout.HORIZONTAL)
         btn_clip = self._small_btn('读剪贴板')
         btn_shot = self._small_btn('截图搜题')
+        btn_latest = self._small_btn('最新截图')
         btn_copy = self._small_btn('复制答案')
-        row2.addView(btn_clip, LLLP(0, -2, 1.0))
-        row2.addView(btn_shot, LLLP(0, -2, 1.0))
-        row2.addView(btn_copy, LLLP(0, -2, 1.0))
+        for b in (btn_clip, btn_shot, btn_latest, btn_copy):
+            row2.addView(b, LLLP(0, -2, 1.0))
         root.addView(row2, LLLP(-1, -2))
 
         # 不设 FLAG_NOT_FOCUSABLE：面板必须能拿到输入焦点，
@@ -510,6 +511,7 @@ class AndroidBridge(object):
                         (btn_send, _send),
                         (btn_clip, _read_clip),
                         (btn_shot, self.capture_and_solve),
+                        (btn_latest, self.solve_from_latest_shot),
                         (btn_copy, _copy)):
             p = _OnClickListener(cb)
             self._proxies.append(p)
@@ -563,6 +565,122 @@ class AndroidBridge(object):
                 traceback.print_exc()
         self._ui_call(do)
 
+    # ---------------- 读最新截图（不依赖 MediaProjection）----------------
+    #: 各家 ROM 存放截图的目录；专放截图的目录直接取最新图片，
+    #: 混合目录（DCIM）只认文件名带 screenshot/截屏/截图的
+    SHOT_DIRS = (
+        ('/sdcard/Pictures/Screenshots', False),
+        ('/sdcard/DCIM/Screenshots', False),
+        ('/sdcard/Pictures/screenshots', False),
+        ('/sdcard/Screenshots', False),
+        ('/sdcard/Pictures/截屏', False),
+        ('/sdcard/DCIM', True),
+        ('/sdcard/Pictures', True),
+    )
+    _SHOT_KEYS = ('screenshot', 'screen_shot', '截屏', '截图')
+
+    def _latest_shot_file(self):
+        """找出最新的一张截图（文件系统方式，不需要截屏授权）。"""
+        newest = None
+        for d, need_key in self.SHOT_DIRS:
+            try:
+                if not os.path.isdir(d):
+                    continue
+                for name in os.listdir(d):
+                    low = name.lower()
+                    if not low.endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                        continue
+                    if need_key and not any(k in low or k in name
+                                           for k in self._SHOT_KEYS):
+                        continue
+                    p = os.path.join(d, name)
+                    try:
+                        m = os.path.getmtime(p)
+                    except Exception:
+                        continue
+                    if newest is None or m > newest[0]:
+                        newest = (m, p)
+            except Exception:
+                traceback.print_exc()
+        return newest[1] if newest else None
+
+    def ensure_media_permission(self):
+        """请求读取图片的权限（Android 13+ 为 READ_MEDIA_IMAGES）。"""
+        try:
+            from android.permissions import request_permissions, Permission
+        except Exception:
+            traceback.print_exc()
+            return
+        perms = []
+        for attr in ('READ_MEDIA_IMAGES', 'READ_EXTERNAL_STORAGE'):
+            try:
+                perms.append(getattr(Permission, attr))
+            except Exception:
+                pass
+        if not perms:
+            return
+        try:
+            request_permissions(perms)
+        except Exception:
+            traceback.print_exc()
+
+    def _prepare_image(self, src_path, dst_path, max_w=1280):
+        """解码并缩放到 max_w 宽，另存 JPEG（原图可能很大，省流量与token）。"""
+        bmp = BitmapFactory.decodeFile(src_path)
+        if bmp is None:
+            raise RuntimeError('无法读取图片（可能没有相册权限）：' + src_path)
+        w, h = bmp.getWidth(), bmp.getHeight()
+        if w > max_w:
+            bmp = Bitmap.createScaledBitmap(bmp, max_w,
+                                            int(h * max_w / float(w)), True)
+        out = FileOutputStream(dst_path)
+        bmp.compress(BitmapFormat.JPEG, 88, out)
+        out.close()
+        return dst_path
+
+    def solve_from_latest_shot(self):
+        """读相册里最新的一张截图去搜题。"""
+        if self._busy:
+            self.toast('正在处理上一题，请稍候…')
+            return
+        self._busy = True
+        self.show_panel('正在查找最新截图…')
+        threading.Thread(target=self._latest_shot_worker, daemon=True).start()
+
+    def _latest_shot_worker(self):
+        try:
+            src = None
+            try:
+                src = self._latest_shot_file()
+            except Exception:
+                traceback.print_exc()
+            if not src:
+                # 没找到：多半是首次使用缺权限，请求一次并提示
+                self.ensure_media_permission()
+                self._set_answer(
+                    '没找到截图。\n\n'
+                    '用法：先按手机的截图快捷键（一般是电源键+音量下，'
+                    '或三指下滑）把题目截下来，再点【最新截图】。\n\n'
+                    '如果这是第一次用：请在系统弹窗里允许读取图片，'
+                    '然后重新点一次。')
+                return
+            dst = os.path.join(str(activity.getCacheDir()), 'latest_shot.jpg')
+            self._prepare_image(src, dst)
+            self._set_answer('已读到截图：%s\n\n正在识别题目…'
+                             % os.path.basename(src))
+            q = ai_core.ocr_question(dst)
+            self._set_answer('【题目】\n' + ai_core.font_safe(q) +
+                             '\n\n正在解答…')
+            answer = ai_core.solve_question(q)
+            self._last_answer = answer
+            self._set_answer('【题目】\n' + ai_core.font_safe(q) +
+                             '\n\n【解答】\n' + ai_core.plain_text(answer))
+        except Exception as e:
+            traceback.print_exc()
+            self._set_answer('错误：' + str(e))
+        finally:
+            self._busy = False
+
     # ---------------- 搜题主流程 ----------------
     def ball_tap_default(self):
         action = self._cfg.get('tap_action', 'screenshot')
@@ -570,13 +688,16 @@ class AndroidBridge(object):
             text = self.get_clipboard().strip()
             if not text:
                 self.show_panel(
-                    '注意：没有读到剪贴板文字。\n\n'
+                    '没有读到剪贴板文字。\n\n'
                     'Android 10+ 只允许当前获焦的应用读剪贴板。\n'
                     '方法1：在题目界面长按选中题目文字 → 复制，'
                     '再点面板里的【读剪贴板】；\n'
-                    '方法2：回到 App，在设置里把点按动作改为「截图搜题」。')
+                    '方法2：回 App 在设置里把点按动作改成「截图搜题」或'
+                    '「读最新截图」。')
                 return
             self.solve_text_async(text)
+        elif action == 'shot':
+            self.solve_from_latest_shot()
         else:
             self.capture_and_solve()
 
@@ -609,9 +730,13 @@ class AndroidBridge(object):
             # 注意：App 在后台时系统会拦截 Toast（实测 Android 15 会打日志
             # "Suppressing toast from package ... by user request"），
             # 用户什么也看不到。所以这里改用悬浮面板给反馈。
-            self.show_panel('还没有截屏授权。\n\n请回到「佛脚AI搜题」，'
-                            '点「② 开启截屏授权」，在弹出的系统对话框里'
-                            '选「立即开始」，然后再点悬浮球搜题。')
+            self.show_panel('还没有截屏授权。\n\n'
+                            'Android 14 起系统要求截屏必须由前台服务承载，'
+                            '授权可能失败。\n'
+                            '可以改用面板上的【最新截图】：先按手机截图快捷键'
+                            '截屏，再点它读取最新截图搜题。\n\n'
+                            '要尝试截屏授权：回到「佛脚AI搜题」点'
+                            '「② 开启截屏授权」。')
             return
         self._busy = True
         self.show_panel('正在截图…')
