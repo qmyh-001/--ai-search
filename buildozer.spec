@@ -24,14 +24,24 @@ p4a.branch = v2024.01.21
 # 只打 arm64（iQOO 11 为骁龙8 Gen2，arm64-v8a），加快构建
 android.archs = arm64-v8a
 
-# target 33（Android 13）：规避 Android 14 对 target34 强制
-# MediaProjection 前台服务类型的限制；min 29 覆盖 Android 10+
+# target 33（Android 13）：保守取值，减少新系统行为变更的影响；
+# min 29 覆盖 Android 10+。
+# 注意：target 33 并不能规避 Android 14+ 对截屏的前台服务要求
+# （实测 Android 16 上 targetSdk=33 仍会抛 SecurityException），
+# 该要求由下面的 services + hook.py 满足。
 android.api = 33
 android.minapi = 29
 
 # INTERNET 联网；SYSTEM_ALERT_WINDOW 悬浮窗（需用户在系统设置里手动允许）
 # READ_MEDIA_IMAGES / READ_EXTERNAL_STORAGE：用于「最新截图」方式读相册里的截图
-android.permissions = android.permission.INTERNET,android.permission.SYSTEM_ALERT_WINDOW,android.permission.READ_MEDIA_IMAGES,android.permission.READ_EXTERNAL_STORAGE
+# FOREGROUND_SERVICE* / POST_NOTIFICATIONS：Android 14+ 截屏要求的前台服务
+android.permissions = android.permission.INTERNET,android.permission.SYSTEM_ALERT_WINDOW,android.permission.READ_MEDIA_IMAGES,android.permission.READ_EXTERNAL_STORAGE,android.permission.FOREGROUND_SERVICE,android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION,android.permission.POST_NOTIFICATIONS
+
+# 前台服务：Android 14 起截屏必须由 foregroundServiceType=mediaProjection
+# 的前台服务承载，否则 getMediaProjection() 抛 SecurityException。
+# 类型属性 p4a v2024.01.21 不支持写在这里，由 hook.py 在构建时注入清单。
+services = medcap:service.py:foreground
+p4a.hook = hook.py
 
 # 自动接受 Android SDK 许可协议。
 # 不设这一项时 sdkmanager 会停下来等待交互输入，导致 build-tools 装不上，

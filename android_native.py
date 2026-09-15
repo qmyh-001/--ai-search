@@ -246,19 +246,53 @@ class AndroidBridge(object):
         if requestCode != self.REQUEST_CODE:
             return
         if resultCode == -1 and data is not None:
-            try:
-                self._projection = self._mpm.getMediaProjection(resultCode, data)
-                try:
-                    cb = _PJCallback(self._on_projection_stopped)
-                    self._proxies.append(cb)
-                    self._projection.registerCallback(cb, None)
-                except Exception:
-                    traceback.print_exc()
-                self.toast('截屏授权成功，可以切到刷题App使用了')
-            except Exception as e:
-                self.toast('截屏授权失败：%s' % e)
+            # 放到工作线程：要先启动前台服务、再拿 MediaProjection，
+            # 这里可能有几百毫秒等待，不该阻塞 UI 线程
+            threading.Thread(target=self._finish_projection,
+                             args=(resultCode, data), daemon=True).start()
         else:
             self.toast('未授予截屏权限')
+
+    #: p4a 按 buildozer.spec 里的 services = medcap:... 生成的 Java 服务类
+    SERVICE_CLASS = 'com.fojiaoai.fojiaoaisearch.ServiceMedcap'
+
+    def _start_capture_service(self):
+        """启动 mediaProjection 类型的前台服务。
+
+        Android 14 起，截屏必须由一个该类的前台服务承载，否则
+        getMediaProjection() 抛 SecurityException：
+        "Media projections require a foreground service of type
+        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION"。
+        """
+        try:
+            Service = autoclass(self.SERVICE_CLASS)
+            Service.start(activity, '')
+            return True
+        except Exception:
+            traceback.print_exc()
+            return False
+
+    def _finish_projection(self, resultCode, data):
+        try:
+            started = self._start_capture_service()
+            if started:
+                # 给系统一点时间把服务提升为前台服务
+                time.sleep(0.8)
+            self._projection = self._mpm.getMediaProjection(resultCode, data)
+            try:
+                cb = _PJCallback(self._on_projection_stopped)
+                self._proxies.append(cb)
+                self._projection.registerCallback(cb, None)
+            except Exception:
+                traceback.print_exc()
+            self.toast('截屏授权成功，可以切到刷题App使用了')
+        except Exception as e:
+            traceback.print_exc()
+            self._set_answer(
+                '截屏授权失败：%s\n\n'
+                'Android 14 起截屏必须由 mediaProjection 类型的前台服务承载。'
+                '若这里仍然失败，请改用面板上的【最新截图】'
+                '（先用手机截图快捷键截屏，再点它读图搜题）。' % e)
 
     def _on_projection_stopped(self):
         self._projection = None
