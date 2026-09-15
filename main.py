@@ -20,7 +20,7 @@ from kivy.properties import StringProperty
 from kivy.storage.jsonstore import JsonStore
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
-from kivy.uix.screenmanager import Screen, ScreenManager
+from kivy.uix.screenmanager import Screen, ScreenManager  # noqa: F401 (KV 里用到 ScreenManager)
 from kivy.utils import platform
 
 import ai_core
@@ -31,7 +31,7 @@ try:
 except Exception:
     bridge = None
 
-IS_ANDROID = platform() == 'android'
+IS_ANDROID = platform == 'android'
 
 HELP_TEXT = (
     '【使用步骤】\n'
@@ -308,8 +308,10 @@ class FojiaoApp(App):
 
     # ---------- 设置 ----------
     def load_settings(self):
+        # JsonStore.put('cfg', **data) 存进去的就是字段字典本身，
+        # get('cfg') 直接返回它，没有再套一层 'data'
         try:
-            d = self.store.get('cfg')['data']
+            d = dict(self.store.get('cfg'))
         except Exception:
             d = {}
         ai_core.cfg.update({
@@ -438,8 +440,11 @@ class FojiaoApp(App):
                     '【解答】\n' + ai_core.plain_text(ans)), 0)
             except Exception as e:
                 traceback.print_exc()
+                # 注意：不能在延迟执行的 lambda 里引用 e，
+                # Python 3 会在 except 块结束时删除该名字
+                err = '❌ ' + str(e)
                 Clock.schedule_once(lambda dt: setattr(
-                    dsk.ids.dresult, 'text', '❌ ' + str(e)), 0)
+                    dsk.ids.dresult, 'text', err), 0)
         threading.Thread(target=worker, daemon=True).start()
 
     # ----------
