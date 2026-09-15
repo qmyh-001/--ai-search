@@ -181,6 +181,7 @@ class AndroidBridge(object):
         self._proxies = []          # 持有 Java 代理对象引用，防 GC
         self._projection = None
         self._mpm = None
+        self._service_cls = None
         self._busy = False
         self._last_answer = ''
         self._cfg = {'tap_action': 'screenshot'}
@@ -245,13 +246,33 @@ class AndroidBridge(object):
     def _on_activity_result(self, requestCode, resultCode, data):
         if requestCode != self.REQUEST_CODE:
             return
-        if resultCode == -1 and data is not None:
-            # 放到工作线程：要先启动前台服务、再拿 MediaProjection，
-            # 这里可能有几百毫秒等待，不该阻塞 UI 线程
-            threading.Thread(target=self._finish_projection,
-                             args=(resultCode, data), daemon=True).start()
-        else:
+        if resultCode != -1 or data is None:
             self.toast('未授予截屏权限')
+            return
+        # 【主线程】解析服务类、启动服务、构造回调。
+        # jnius 的类查找底层是 JNI FindClass，在 threading.Thread 这种
+        # 附加线程上会用系统类加载器，看不到本应用的类（实测报
+        # ClassNotFoundException: ...ServiceMedcap）。
+        try:
+            self._start_capture_service()
+        except Exception:
+            traceback.print_exc()
+        cb = None
+        try:
+            cb = _PJCallback(self._on_projection_stopped)
+            self._proxies.append(cb)
+        except Exception:
+            # Android 14 起 MediaProjection.Callback 从接口改成了抽象类，
+            # jnius 无法用 PythonJavaClass 实现它。该回调只用于感知
+            # "授权被系统回收"，不是截屏必需，跳过即可。
+            from kivy.logger import Logger
+            Logger.info('[fojiao] 跳过 MediaProjection 回调'
+                        '（Android 14+ 已改为抽象类）')
+        # 【工作线程】前台服务是异步起来的（p4a 的服务要先启动一个
+        # Python 解释器，实测 1 秒以上才调 startForeground），
+        # 所以轮询重试直到就绪，再取 MediaProjection。
+        threading.Thread(target=self._wait_projection,
+                         args=(resultCode, data, cb), daemon=True).start()
 
     #: p4a 按 buildozer.spec 里的 services = medcap:... 生成的 Java 服务类
     SERVICE_CLASS = 'com.fojiaoai.fojiaoaisearch.ServiceMedcap'
@@ -264,35 +285,48 @@ class AndroidBridge(object):
         "Media projections require a foreground service of type
         ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION"。
         """
-        try:
-            Service = autoclass(self.SERVICE_CLASS)
-            Service.start(activity, '')
-            return True
-        except Exception:
-            traceback.print_exc()
-            return False
+        if self._service_cls is None:
+            self._service_cls = autoclass(self.SERVICE_CLASS)
+        self._service_cls.start(activity, '')
+        return True
 
-    def _finish_projection(self, resultCode, data):
-        try:
-            started = self._start_capture_service()
-            if started:
-                # 给系统一点时间把服务提升为前台服务
-                time.sleep(0.8)
-            self._projection = self._mpm.getMediaProjection(resultCode, data)
+    def _wait_projection(self, resultCode, data, cb):
+        """等前台服务就绪后取 MediaProjection。
+
+        p4a 的服务跑在独立进程里，要先启动一个 Python 解释器才调用
+        startForeground()，实测要 1 秒以上。所以这里分次重试（间隔 1 秒、
+        最多约 8 秒），等前台服务真正就绪再取。
+        """
+        from kivy.logger import Logger
+        Logger.info('[fojiao] 等待前台服务就绪…')
+        proj = None
+        err = None
+        for i in range(8):
             try:
-                cb = _PJCallback(self._on_projection_stopped)
-                self._proxies.append(cb)
-                self._projection.registerCallback(cb, None)
-            except Exception:
-                traceback.print_exc()
-            self.toast('截屏授权成功，可以切到刷题App使用了')
-        except Exception as e:
-            traceback.print_exc()
+                proj = self._mpm.getMediaProjection(resultCode, data)
+                Logger.info('[fojiao] MediaProjection 获取成功（第 %d 次）'
+                            % (i + 1))
+                break
+            except Exception as e:
+                err = e
+                Logger.info('[fojiao] 第 %d 次尚未就绪: %s' % (i + 1, e))
+                time.sleep(1.0)
+        if proj is None:
+            Logger.error('[fojiao] 重试仍未成功: %s' % err)
             self._set_answer(
-                '截屏授权失败：%s\n\n'
-                'Android 14 起截屏必须由 mediaProjection 类型的前台服务承载。'
-                '若这里仍然失败，请改用面板上的【最新截图】'
-                '（先用手机截图快捷键截屏，再点它读图搜题）。' % e)
+                '截屏授权没成功：%s\n\n'
+                '可以再点一次「② 开启截屏授权」（前台服务此时已经在跑，'
+                '第二次通常就过了）；\n'
+                '或者改用面板上的【最新截图】：先用手机截图快捷键截屏，'
+                '再点它读图搜题。' % err)
+            return
+        self._projection = proj
+        if cb is not None:
+            try:
+                proj.registerCallback(cb, None)
+            except Exception:
+                Logger.info('[fojiao] 注册回调失败，忽略')
+        self.toast('截屏授权成功，可以切到刷题App使用了')
 
     def _on_projection_stopped(self):
         self._projection = None
