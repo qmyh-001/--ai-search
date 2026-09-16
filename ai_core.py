@@ -255,22 +255,100 @@ def ocr_question(image_path):
     return text
 
 
-def solve_question(question):
-    """调用解题模型，返回答案+解题思路的文本。
+#: 当前会话的消息历史：system + 若干轮 user/assistant。
+#: 新问题会清空，追问会接着它 —— 这样"为什么选 B"这种追问才看得到题目。
+_history = []
 
-    使用「API 设置」里的自定义提示词（为空则用内置默认），
-    并按思考强度设置决定是否开启思考模式。
+#: 最多保留多少条历史消息（不含 system）。3 轮问答左右，够用又不至于烧 token
+_HISTORY_LIMIT = 6
+
+
+def _system_message():
+    return {'role': 'system', 'content': solve_prompt()}
+
+
+def reset_conversation():
+    """开始新的一题：丢掉上下文。"""
+    del _history[:]
+
+
+def _trim(messages):
+    if len(messages) <= _HISTORY_LIMIT + 1:
+        return list(messages)
+    return [messages[0]] + messages[-_HISTORY_LIMIT:]
+
+
+def _cap_history():
+    """把存下来的历史也裁到上限。
+
+    只裁"发出去的消息"是不够的：聊得越久存的历史越长（内存和后续裁剪
+    都会白白变大）。_HISTORY_LIMIT 取偶数，裁剪后仍是完整的问答对。
     """
-    messages = [
-        {'role': 'system', 'content': solve_prompt()},
-        {'role': 'user', 'content': question},
-    ]
-    content, reasoning = _post_chat(cfg['solve_model'], messages, timeout=300)
+    extra = len(_history) - 1 - _HISTORY_LIMIT
+    if extra > 0:
+        del _history[1:1 + extra]
+
+
+def _ask(messages):
+    """把会话发给解题模型并返回正文（没有正文时用思考内容兜底）。"""
+    content, reasoning = _post_chat(cfg['solve_model'], _trim(messages),
+                                    timeout=300)
     if not content:
         content = reasoning
     if not content:
         raise RuntimeError('模型没有返回内容，请重试')
     return content
+
+
+def solve_question(question):
+    """新问题：清掉上一题的上下文，重新开始。
+
+    截图搜题 / 最新截图 / 读剪贴板 这些路径都是"一道新题"，走这里。
+    答完会把这一轮问答留在会话里，方便后面用 followup_question() 接着问。
+    """
+    reset_conversation()
+    _history.append(_system_message())
+    _history.append({'role': 'user', 'content': question})
+    try:
+        answer = _ask(_history)
+    except Exception:
+        # 失败就把这条提问撤掉，别把烂上下文留在历史里
+        _history.pop()
+        raise
+    _history.append({'role': 'assistant', 'content': answer})
+    _cap_history()
+    return answer
+
+
+def followup_question(question):
+    """追问：接着上一题/上一段上下文继续问。
+
+    面板上的「问」走这里 —— 比如看完解析再问"为什么选 B"，
+    模型能看到前面的题目与解答；没有上下文时（App 刚起来）自动当成新问题。
+    """
+    if not _history:
+        return solve_question(question)
+    # 提示词可能被用户在设置里改过，每次追问刷新一下首条系统提示
+    _history[0] = _system_message()
+    _history.append({'role': 'user', 'content': question})
+    try:
+        answer = _ask(_history)
+    except Exception:
+        _history.pop()
+        raise
+    _history.append({'role': 'assistant', 'content': answer})
+    _cap_history()
+    return answer
+
+
+def has_conversation():
+    """当前是否有可追问的上下文。"""
+    return bool(_history)
+
+
+def conversation_turns():
+    """已经聊了几轮（题目 + 追问），界面/调试用。"""
+    return max(0, (len(_history) - 1) // 2)
 
 
 def list_models():

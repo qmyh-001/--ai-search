@@ -50,6 +50,16 @@ try:
     ImageReader = autoclass('android.media.ImageReader')
     DisplayManager = autoclass('android.hardware.display.DisplayManager')
     Toast = autoclass('android.widget.Toast')
+    FrameLayout = autoclass('android.widget.FrameLayout')
+    FrameLayoutLP = autoclass('android.widget.FrameLayout$LayoutParams')
+    ObjectAnimator = autoclass('android.animation.ObjectAnimator')
+    LinearInterpolator = autoclass('android.view.animation.LinearInterpolator')
+    DecelerateInterpolator = autoclass(
+        'android.view.animation.DecelerateInterpolator')
+    ProgressBar = autoclass('android.widget.ProgressBar')
+    Typeface = autoclass('android.graphics.Typeface')
+    RotateAnimation = autoclass('android.view.animation.RotateAnimation')
+    Anim = autoclass('android.view.animation.Animation')
     ANDROID = True
 except Exception:  # 桌面调试
     pass
@@ -75,6 +85,82 @@ def _s(text):
 
 def _argb(a, r, g, b):
     return _c((a << 24) | (r << 16) | (g << 8) | b)
+
+
+# ---------------- iOS 亮色配色（与 main.py 里的界面配色保持一致）----------------
+C_BLUE = 0xFF0A84FF
+C_BLUE_DARK = 0xFF0060DF
+C_BLUE_TINT = 0xFFE9F3FF
+C_GRAY_FILL = 0xFFF2F2F7
+C_GRAY_FILL2 = 0xFFE5E5EA
+C_TITLE = 0xFF1C1C1E
+C_BODY = 0xFF3A3A3C
+C_GRAY = 0xFF8E8E93
+C_SEP = 0xFFE5E5EA
+
+#: 原生控件里要用到的 Lucide 图标码位（字体随包，见 main.py 的 ICON）
+_ICON_GLYPH = {
+    'search': '\ue151',
+    'resize': '\ue1c5',      # move-diagonal-2（↙↗）：拖动改大小
+}
+
+#: 画面全黑时的提示。真机上实测有两种成因，按常见程度排：
+#: ① 授权时选的是"共享一个应用"，那个应用不在前台时截到的就是空画面；
+#: ② 目标应用自己禁止截屏（FLAG_SECURE / 系统隐私保护）。
+BLACK_FRAME_HINT = (
+    '截到的画面是空的（全黑），两个常见原因：\n\n'
+    '① 授权时选的是「共享一个应用」\n'
+    '这种模式下只有那个应用在前台时才截得到画面。请在要搜题的'
+    'App 界面里点悬浮球；或者重新授权时改选「共享整个屏幕」。\n\n'
+    '② 该应用禁止被截屏\n'
+    '有些应用会开启系统隐私保护（银行、支付类常见），'
+    '任何截屏方式都拿不到画面。\n\n'
+    '这两种情况都可以改用【读剪贴板】（在题目界面长按选中题目文字 → '
+    '复制，再回到这个面板点【读剪贴板】）；如果那个界面连复制都不让用，'
+    '就直接把题目打字或粘贴到面板的输入框里，点【问】。'
+)
+
+#: 面板第一次打开时的引导语（顺便把"隐私应用"和"能追问"说清楚）
+PANEL_INTRO = (
+    '点【截图搜题】自动截屏识别。\n\n'
+    '· 出答案后，在下面输入框里接着问（比如"为什么选 B"），'
+    '会带着这道题继续回答\n'
+    '· 也可以直接把题目打字/粘贴进输入框，点【问】\n'
+    '· 截到的画面全黑时，多半是授权选了「共享一个应用」——'
+    '在要搜题的 App 界面里点悬浮球，或者重新授权选「共享整个屏幕」'
+)
+
+
+def _stateful(normal, pressed):
+    """带按下反馈的背景（StateListDrawable）；失败就退回静态背景。"""
+    try:
+        sld = autoclass('android.graphics.drawable.StateListDrawable')()
+        sld.addState([autoclass('android.R$attr').state_pressed], pressed)
+        sld.addState([], normal)
+        return sld
+    except Exception:
+        return normal
+
+
+def _rounded(color, radius, stroke_w=0, stroke_color=0):
+    """圆角矩形背景（Android GradientDrawable）。"""
+    gd = GradientDrawable()
+    gd.setShape(GradientDrawable.RECTANGLE)
+    gd.setColor(_c(color))
+    gd.setCornerRadius(float(radius))
+    if stroke_w:
+        gd.setStroke(int(stroke_w), _c(stroke_color))
+    return gd
+
+
+def _oval(color, stroke_w=0, stroke_color=0):
+    """圆形背景。"""
+    gd = GradientDrawable()
+    gd.setShape(GradientDrawable.OVAL)
+    gd.setColor(_c(color))
+    if stroke_w:
+        gd.setStroke(int(stroke_w), _c(stroke_color))
+    return gd
 
 
 if ANDROID:
@@ -194,6 +280,18 @@ class AndroidBridge(object):
         self._panel_base = (0, 0)
         self._answer_tv = None
         self._edit = None
+        #: 状态行（加载指示器 + "正在…"文案）
+        self._status_row = None
+        self._status_tv = None
+        #: 答案区的纯文本（Python 侧持有，追加/替换都基于它，避免来回取 Java 字符串）
+        self._panel_text = ''
+        self._answer_sv = None
+        #: 用户拖出来的面板尺寸（本进程内记住）；None = 用默认尺寸
+        self._panel_size = None
+        self._resize_base = None
+        #: 图标字体 / 加载动画引用
+        self._typeface = None
+        self._loader_anim = None
         self._proxies = []          # 持有 Java 代理对象引用，防 GC
         self._projection = None
         self._reader = None         # 常驻的截屏 ImageReader
@@ -208,6 +306,8 @@ class AndroidBridge(object):
         self._projection_callback_cls = None
         #: 正在等一次新授权（此时旧投影被回收是正常现象，不该弹提示）
         self._auth_in_progress = False
+        #: 本进程里是否建过截屏会话（换授权时用它决定要不要等旧显示拆完）
+        self._had_session = False
         self._mpm = None
         self._service_cls = None
         self._busy = False
@@ -363,10 +463,12 @@ class AndroidBridge(object):
         # 并直接弹出悬浮球 —— 省掉"回 App 点③再切回来"这一圈。
         self._session_attempted = False
         # 换授权时要等一下：旧投影的虚拟显示是系统在 onStop 之后异步拆掉的
-        # （实测“释放旧显示”和“新建显示”只差 2ms），紧挨着立刻重建的话，
+        # （实测"释放旧显示"和"新建显示"只差 2ms），紧挨着立刻重建的话，
         # 新显示 state=ON 却一帧都不送。这里在**工作线程**上等（不能在
         # 主线程 sleep，会卡住 UI）。
-        if self._reader is not None or self._vd is not None:
+        # 用 _had_session 判断而不是看 _reader/_vd 是否还在：那两个引用会被
+        # onStop 的异步释放清掉，读它等于在赌时序，有时会漏掉这次等待。
+        if self._had_session:
             Logger.info('[fojiao] 换授权：等旧截屏显示拆干净再重建…')
             time.sleep(1.5)
         self.start_capture_session()
@@ -439,39 +541,69 @@ class AndroidBridge(object):
 
     @run_on_ui_thread
     def _show_ball_ui(self):
+        """iOS 风的悬浮球：蓝色圆 + 白色图标 + 一圈柔和投影。
+
+        窗口比球本身大一圈（多的部分放投影），所以拖动时视觉上会有一点点
+        偏移，这是为了让投影有地方画（悬浮窗内部没有系统阴影可用）。
+        """
         if self._ball is not None:
             self._ball.setVisibility(View.VISIBLE)
             return
         sw, sh = self._screen()
         size = self._dp(56)
-        b = Button(activity)
-        gd = GradientDrawable()
-        gd.setShape(GradientDrawable.OVAL)
-        gd.setColor(_argb(235, 37, 99, 235))
-        gd.setStroke(self._dp(2), _argb(255, 255, 255, 255))
-        b.setBackground(gd)
-        b.setText(_s('搜'))
-        b.setTextColor(_argb(255, 255, 255, 255))
-        b.setTextSize(20.0)
-        lp = WMLP(size, size, WMLP.TYPE_APPLICATION_OVERLAY,
+        pad = self._dp(7)
+        total = size + pad * 2
+
+        root = FrameLayout(activity)
+        # 投影：比球略大、往下偏一点的黑圆
+        shadow = View(activity)
+        shadow.setBackground(_oval(_argb(28, 0, 0, 0)))
+        slp = FrameLayoutLP(size, size, Gravity.TOP | Gravity.START)
+        slp.leftMargin = pad
+        slp.topMargin = pad + self._dp(2)
+        root.addView(shadow, slp)
+
+        ball = View(activity)
+        ball.setBackground(_oval(C_BLUE, self._dp(0.5), _argb(60, 255, 255, 255)))
+        blp = FrameLayoutLP(size, size, Gravity.TOP | Gravity.START)
+        blp.leftMargin = pad
+        blp.topMargin = pad
+        root.addView(ball, blp)
+
+        glyph = TextView(activity)
+        glyph.setText(_s(self._icon_glyph('search', '搜')))
+        glyph.setTypeface(self._icon_typeface())
+        glyph.setTextColor(_argb(255, 255, 255, 255))
+        glyph.setTextSize(22.0)
+        glyph.setGravity(Gravity.CENTER)
+        glp = FrameLayoutLP(size, size, Gravity.TOP | Gravity.START)
+        glp.leftMargin = pad
+        glp.topMargin = pad
+        root.addView(glyph, glp)
+
+        lp = WMLP(total, total, WMLP.TYPE_APPLICATION_OVERLAY,
                   WMLP.FLAG_NOT_FOCUSABLE | WMLP.FLAG_NOT_TOUCH_MODAL,
                   PixelFormat.TRANSLUCENT)
         lp.gravity = Gravity.TOP | Gravity.START
-        lp.x = sw - size - self._dp(14)
+        lp.x = sw - total - self._dp(8)
         lp.y = int(sh * 0.55)
 
         def on_down():
             self._ball_base = (lp.x, lp.y)
-            b.setAlpha(0.6)
+            ball.setAlpha(0.55)
+            glyph.setAlpha(0.55)
+            root.animate().scaleX(0.94).scaleY(0.94).setDuration(90).start()
 
         def on_up():
-            b.setAlpha(1.0)
+            ball.setAlpha(1.0)
+            glyph.setAlpha(1.0)
+            root.animate().scaleX(1.0).scaleY(1.0).setDuration(150).start()
 
         def on_drag(dx, dy):
             lp.x = int(self._ball_base[0] + dx)
             lp.y = int(self._ball_base[1] + dy)
             try:
-                self._wm.updateViewLayout(b, lp)
+                self._wm.updateViewLayout(root, lp)
             except Exception:
                 pass
 
@@ -479,9 +611,14 @@ class AndroidBridge(object):
         tl = _OnTouchListener(self.ball_tap_default, on_drag, on_down, on_up,
                               self._dp(6))
         self._proxies.append(tl)
-        b.setOnTouchListener(tl)
-        self._wm.addView(b, lp)
-        self._ball = b
+        root.setOnTouchListener(tl)
+        self._wm.addView(root, lp)
+
+        # 入场：淡入 + 轻微放大
+        root.setAlpha(0.0)
+        root.animate().alpha(1.0).setDuration(200).setInterpolator(
+            DecelerateInterpolator()).start()
+        self._ball = root
         self._ball_lp = lp
 
     def hide_ball(self):
@@ -522,71 +659,124 @@ class AndroidBridge(object):
             self._build_panel()
         if self._panel is not None:
             self._panel.setVisibility(View.VISIBLE)
-        if text and self._answer_tv is not None:
-            self._answer_tv.setText(_s(text))
+        if text:
+            if self._answer_tv is not None:
+                self._answer_tv.setText(_s(text))
+            # 有结果了就收起"正在…"
+            if self._status_row is not None:
+                self._status_row.setVisibility(View.GONE)
 
     def _build_panel(self):
+        """浅色 iOS 风面板：白色圆角卡片 + 蓝色主按钮 + 八段加载指示器。
+
+        面板会挡住题目，所以标题栏上放了一个"拖动改大小"的手柄：
+        拖它就能把面板收小/放大，尺寸在本次运行内记住（关掉再开还是这个大小）。
+        """
         sw, sh = self._screen()
-        pw, ph = int(sw * 0.88), int(sh * 0.52)
+        if self._panel_size:
+            pw, ph = self._panel_size
+        else:
+            pw, ph = int(sw * 0.90), int(sh * 0.52)
+        pw = max(self._dp(240), min(sw, pw))
+        ph = max(self._dp(200), min(sh, ph))
 
         root = LinearLayout(activity)
         root.setOrientation(LinearLayout.VERTICAL)
-        bg = GradientDrawable()
-        bg.setColor(_argb(243, 17, 24, 39))
-        bg.setCornerRadius(float(self._dp(16)))
-        root.setBackground(bg)
-        root.setPadding(self._dp(14), self._dp(8), self._dp(14), self._dp(10))
+        root.setBackground(_rounded(0xFFFFFFFF, self._dp(20)))
+        root.setPadding(self._dp(16), self._dp(12), self._dp(16), self._dp(14))
 
-        # 标题栏（拖动区）+ 最小化 + 关闭
+        # 标题栏（拖动区）+ 改大小 + 最小化 + 关闭
         title = LinearLayout(activity)
         title.setOrientation(LinearLayout.HORIZONTAL)
+        title.setGravity(Gravity.CENTER_VERTICAL)
         tv = TextView(activity)
-        tv.setText(_s('AI 解题'))
-        tv.setTextColor(_argb(255, 147, 197, 253))
+        tv.setText(_s('解题助手'))
+        tv.setTextColor(_argb(255, 28, 28, 30))
         tv.setTextSize(15.0)
+        tv.setTypeface(Typeface.DEFAULT_BOLD)
         title.addView(tv, LLLP(0, -2, 1.0))
-        btn_min = self._small_btn('—')
-        btn_close = self._small_btn('×')
-        title.addView(btn_min, LLLP(-2, -2))
-        title.addView(btn_close, LLLP(-2, -2))
+        btn_resize = self._icon_btn('resize', '↘')
+        btn_min = self._round_icon_btn('—')
+        btn_close = self._round_icon_btn('×')
+        title.addView(btn_resize, self._lp(self._dp(30), self._dp(30), 0, 8))
+        title.addView(btn_min, self._lp(self._dp(30), self._dp(30), 0, 8))
+        title.addView(btn_close, self._lp(self._dp(30), self._dp(30)))
         root.addView(title, LLLP(-1, -2))
+
+        sep = View(activity)
+        sep.setBackgroundColor(_c(C_SEP))
+        root.addView(sep, LLLP(-1, max(1, self._dp(0.6))))
+
+        # 状态行（加载指示器 + 文案），平时隐藏
+        srow = LinearLayout(activity)
+        srow.setOrientation(LinearLayout.HORIZONTAL)
+        srow.setGravity(Gravity.CENTER_VERTICAL)
+        srow.setPadding(0, self._dp(10), 0, 0)
+        loader = self._make_loader(self._dp(16))
+        srow.addView(loader, LLLP(self._dp(16), self._dp(16)))
+        stv = TextView(activity)
+        stv.setTextColor(_argb(255, 142, 142, 147))
+        stv.setTextSize(13.0)
+        stv.setPadding(self._dp(8), 0, 0, 0)
+        srow.addView(stv, LLLP(0, -2, 1.0))
+        srow.setVisibility(View.GONE)
+        root.addView(srow, LLLP(-1, -2))
 
         # 答案区
         sv = ScrollView(activity)
         sv.setFillViewport(True)
         ans = TextView(activity)
-        ans.setTextColor(_argb(240, 229, 231, 235))
-        ans.setTextSize(14.0)
-        ans.setPadding(0, self._dp(8), 0, self._dp(8))
+        ans.setTextColor(_argb(255, 58, 58, 60))
+        ans.setTextSize(15.0)
+        try:
+            ans.setLineSpacing(0.0, 1.18)
+        except Exception:
+            pass
+        ans.setText(_s(PANEL_INTRO))
+        ans.setPadding(0, self._dp(10), 0, self._dp(10))
         sv.addView(ans)
         root.addView(sv, LLLP(-1, 0, 1.0))
+        self._panel_text = PANEL_INTRO
+        self._answer_sv = sv
 
-        # 输入行：输入框 + 弹键盘 + 提问
+        # 输入行：药丸形输入框（点它直接弹键盘）+ 圆形「问」
+        # 两者都 44dp 高、垂直居中，间距 10dp —— 尺寸不齐会很显眼
+        row_h = self._dp(44)
         row = LinearLayout(activity)
         row.setOrientation(LinearLayout.HORIZONTAL)
+        row.setGravity(Gravity.CENTER_VERTICAL)
         edit = EditText(activity)
-        edit.setHint(_s('点这里输入/粘贴题目'))
-        edit.setTextColor(_argb(255, 255, 255, 255))
-        edit.setHintTextColor(_argb(170, 156, 163, 175))
-        edit.setTextSize(13.0)
+        edit.setHint(_s('输入题目，或接着追问…'))
+        edit.setTextColor(_argb(255, 28, 28, 30))
+        edit.setHintTextColor(_argb(255, 142, 142, 147))
+        edit.setTextSize(14.5)
         edit.setMaxLines(3)
-        btn_kbd = self._small_btn('键盘')
-        btn_send = self._small_btn('问')
-        row.addView(edit, LLLP(0, -2, 1.0))
-        row.addView(btn_kbd, LLLP(-2, -2))
-        row.addView(btn_send, LLLP(-2, -2))
-        root.addView(row, LLLP(-1, -2))
+        # 单行时文字要垂直居中（多行时整块居中）
+        edit.setGravity(Gravity.CENTER_VERTICAL | Gravity.START)
+        # 药丸形输入框（iOS 聊天框那种），圆角取高度的一半
+        edit.setBackground(_rounded(C_GRAY_FILL, row_h / 2.0))
+        edit.setPadding(self._dp(16), self._dp(4), self._dp(16), self._dp(4))
+        btn_send = self._circle_btn('问', size_pt=14.0)
+        row.addView(edit, LLLP(0, row_h, 1.0))
+        lp_send = LLLP(row_h, row_h)
+        lp_send.setMargins(self._dp(10), 0, 0, 0)
+        row.addView(btn_send, lp_send)
+        # 输入行和上面的答案区留一点呼吸间距，文字不要贴着输入框
+        lp_row = LLLP(-1, -2)
+        lp_row.setMargins(0, self._dp(8), 0, 0)
+        root.addView(row, lp_row)
 
-        # 功能按钮行
+        # 功能按钮行：主操作实心蓝，其余淡蓝/浅灰
         row2 = LinearLayout(activity)
         row2.setOrientation(LinearLayout.HORIZONTAL)
-        btn_clip = self._small_btn('读剪贴板')
-        btn_shot = self._small_btn('截图搜题')
-        btn_latest = self._small_btn('最新截图')
-        btn_copy = self._small_btn('复制答案')
-        for b in (btn_clip, btn_shot, btn_latest, btn_copy):
-            row2.addView(b, LLLP(0, -2, 1.0))
-        root.addView(row2, LLLP(-1, -2))
+        btn_shot = self._pill('截图搜题', 'filled', size=12.5, bold=True)
+        btn_latest = self._pill('最新截图', 'tinted', size=12.5)
+        btn_clip = self._pill('读剪贴板', 'tinted', size=12.5)
+        btn_copy = self._pill('复制答案', 'gray', size=12.5)
+        for i, b in enumerate((btn_shot, btn_latest, btn_clip, btn_copy)):
+            row2.addView(b, self._lp(0, self._dp(44), 1.0,
+                                     0 if i == 0 else 6))
+        root.addView(row2, self._lp(-1, self._dp(48), 0, 0))
 
         # 不设 FLAG_NOT_FOCUSABLE：面板必须能拿到输入焦点，
         # EditText 才能正常编辑、也才能读剪贴板（Android 10+ 只允许获焦应用读）。
@@ -616,8 +806,36 @@ class AndroidBridge(object):
         self._proxies.append(tl)
         title.setOnTouchListener(tl)
 
+        # 标题栏上那个手柄：拖它改面板大小（左上角固定，往右下扩）
+        min_w, min_h = self._dp(240), self._dp(200)
+
+        def on_resize_down():
+            self._resize_base = (lp.width, lp.height)
+
+        def on_resize_drag(dx, dy):
+            base_w, base_h = self._resize_base or (lp.width, lp.height)
+            lp.width = int(max(min_w, min(base_w + dx, sw - lp.x)))
+            lp.height = int(max(min_h, min(base_h + dy, sh - lp.y)))
+            try:
+                self._wm.updateViewLayout(root, lp)
+            except Exception:
+                pass
+            self._panel_size = (lp.width, lp.height)
+
+        rl = _OnTouchListener(None, on_resize_drag, on_resize_down, None,
+                              self._dp(4))
+        self._proxies.append(rl)
+        btn_resize.setOnTouchListener(rl)
+        # 手柄只是用来拖的，点它别去触发"最小化"之类的行为
+        btn_resize.setClickable(False)
+
         def _show_keyboard():
-            # 弹软键盘并让面板避让出输入框位置
+            """点输入框就弹软键盘。
+
+            悬浮窗不是普通 Activity 的窗口，有的 ROM 不会自动弹，
+            所以这里显式 requestFocus + showSoftInput 一次；同时让面板
+            按 resize 模式避让，输入框不会被键盘盖住。
+            """
             edit.requestFocus()
             try:
                 lp.softInputMode = (WMLP.SOFT_INPUT_ADJUST_RESIZE
@@ -625,9 +843,13 @@ class AndroidBridge(object):
                 self._wm.updateViewLayout(root, lp)
             except Exception:
                 pass
-            imm = cast('android.view.inputmethod.InputMethodManager',
-                       activity.getSystemService(Context.INPUT_METHOD_SERVICE))
-            imm.showSoftInput(edit, 0)
+            try:
+                imm = cast('android.view.inputmethod.InputMethodManager',
+                           activity.getSystemService(
+                               Context.INPUT_METHOD_SERVICE))
+                imm.showSoftInput(edit, 0)
+            except Exception:
+                traceback.print_exc()
 
         def _close():
             try:
@@ -638,6 +860,10 @@ class AndroidBridge(object):
             self._panel_lp = None
             self._answer_tv = None
             self._edit = None
+            self._status_row = None
+            self._status_tv = None
+            self._answer_sv = None
+            self._panel_text = ''
 
         def _read_clip():
             # 面板窗口可获焦，点这个按钮的瞬间焦点已在面板上，
@@ -655,12 +881,24 @@ class AndroidBridge(object):
             threading.Thread(target=worker, daemon=True).start()
 
         def _send():
-            q = str(edit.getText().toString()).strip()
+            """「问」：有上下文就接着这道题追问，没有就当新问题。
+
+            注意：pyjnius 有时已经把 getText() 的 Editable 转成 Python str，
+            这时再调 .toString() 会 AttributeError（实测踩过），两种都要兼容
+            """
+            try:
+                t = edit.getText()
+                q = str(t if isinstance(t, str) else t.toString()).strip()
+            except Exception:
+                q = ''
             if not q:
-                self._set_answer('请先在输入框里输入或粘贴题目，'
-                                 '再点「问」。')
+                self._set_answer('请先在输入框里输入要问的内容。')
                 return
-            self.solve_text_async(q)
+            self._ui_call(lambda: edit.setText(_s('')))
+            if ai_core.has_conversation():
+                self.followup_async(q)
+            else:
+                self.solve_text_async(q)
 
         def _copy():
             if self._last_answer:
@@ -671,7 +909,6 @@ class AndroidBridge(object):
 
         for btn, cb in ((btn_min, lambda: root.setVisibility(View.GONE)),
                         (btn_close, _close),
-                        (btn_kbd, _show_keyboard),
                         (btn_send, _send),
                         (btn_clip, _read_clip),
                         (btn_shot, self.capture_and_solve),
@@ -681,19 +918,191 @@ class AndroidBridge(object):
             self._proxies.append(p)
             btn.setOnClickListener(p)
 
+        # 点输入框直接弹键盘（原来是旁边一个「键盘」按钮，去掉了）
+        kbd = _OnClickListener(_show_keyboard)
+        self._proxies.append(kbd)
+        edit.setOnClickListener(kbd)
+
         self._wm.addView(root, lp)
         self._panel = root
         self._panel_lp = lp
         self._answer_tv = ans
         self._edit = edit
+        self._status_row = srow
+        self._status_tv = stv
 
-    def _small_btn(self, text):
+        # 入场：淡入 + 轻微上浮
+        root.setAlpha(0.0)
+        root.setTranslationY(float(self._dp(10)))
+        root.animate().alpha(1.0).translationY(0.0).setDuration(
+            220).setInterpolator(DecelerateInterpolator()).start()
+
+    # ---------------- 组件工厂 ----------------
+    def _lp(self, w, h, weight=0.0, margin=0):
+        """LinearLayout 参数：w/h 传 -1/-2 表示 match_parent/wrap_content。"""
+        lp = LLLP(w, h, weight)
+        m = self._dp(margin)
+        lp.setMargins(m, self._dp(2), 0, self._dp(2))
+        return lp
+
+    def _round_icon_btn(self, glyph):
+        """标题栏右上角那种小圆按钮（浅灰底 + 灰色字）。"""
+        b = TextView(activity)
+        b.setText(_s(glyph))
+        b.setTextSize(15.0)
+        b.setTextColor(_argb(255, 142, 142, 147))
+        b.setGravity(Gravity.CENTER)
+        b.setBackground(_stateful(_oval(C_GRAY_FILL), _oval(C_GRAY_FILL2)))
+        return b
+
+    def _icon_btn(self, name, fallback, size_pt=15.0):
+        """带图标的小圆按钮（图标字体缺失时退回 fallback 里的文字符号）。"""
+        glyph = self._icon_glyph(name, fallback)
+        b = self._round_icon_btn(glyph)
+        b.setTextSize(size_pt)
+        if glyph == _ICON_GLYPH.get(name):
+            b.setTypeface(self._icon_typeface())
+        return b
+
+    def _pill(self, text, kind='tinted', size=13.0, bold=False):
+        """iOS 风按钮：filled(实心蓝) / tinted(淡蓝底) / gray(浅灰底)。"""
+        text_color = {'filled': (255, 255, 255), 'tinted': (10, 132, 255),
+                      'gray': (28, 28, 30)}.get(kind, (10, 132, 255))
+        fill = {'filled': C_BLUE, 'tinted': C_BLUE_TINT,
+                'gray': C_GRAY_FILL}.get(kind, C_BLUE_TINT)
+        press = {'filled': C_BLUE_DARK, 'tinted': 0xFFD8E9FF,
+                 'gray': C_GRAY_FILL2}.get(kind, 0xFFD8E9FF)
         b = Button(activity)
         b.setText(_s(text))
-        b.setTextColor(_argb(255, 147, 197, 253))
-        b.setTextSize(12.0)
-        b.setPadding(self._dp(8), self._dp(2), self._dp(8), self._dp(2))
+        b.setTextSize(size)
+        b.setTextColor(_argb(255, *text_color))
+        r = self._dp(11)
+        b.setBackground(_stateful(_rounded(fill, r), _rounded(press, r)))
+        try:
+            b.setAllCaps(False)
+            b.setTypeface(Typeface.DEFAULT_BOLD if bold else Typeface.DEFAULT)
+            # Material 主题给 Button 设了最小尺寸，会撑坏行高，这里清零
+            b.setMinWidth(0)
+            b.setMinimumWidth(0)
+            b.setMinHeight(0)
+            b.setMinimumHeight(0)
+        except Exception:
+            pass
+        b.setPadding(self._dp(4), 0, self._dp(4), 0)
         return b
+
+    def _circle_btn(self, text, size_pt=17.0, kind='filled', bold=True):
+        """圆形按钮（输入框右边那个「问」）。
+
+        直径由调用方用 LayoutParams 给（宽高相等就是正圆）——
+        这里只管颜色、字号、清零系统默认的最小尺寸和 padding。
+        """
+        b = Button(activity)
+        b.setText(_s(text))
+        b.setTextSize(size_pt)
+        text_color = {'filled': (255, 255, 255), 'tinted': (10, 132, 255),
+                      'gray': (28, 28, 30)}.get(kind, (255, 255, 255))
+        fill = {'filled': C_BLUE, 'tinted': C_BLUE_TINT,
+                'gray': C_GRAY_FILL}.get(kind, C_BLUE)
+        press = {'filled': C_BLUE_DARK, 'tinted': 0xFFD8E9FF,
+                 'gray': C_GRAY_FILL2}.get(kind, C_BLUE_DARK)
+        b.setTextColor(_argb(255, *text_color))
+        b.setBackground(_stateful(_oval(fill), _oval(press)))
+        try:
+            b.setAllCaps(False)
+            b.setTypeface(Typeface.DEFAULT_BOLD if bold else Typeface.DEFAULT)
+            b.setGravity(Gravity.CENTER)
+            b.setMinWidth(0)
+            b.setMinimumWidth(0)
+            b.setMinHeight(0)
+            b.setMinimumHeight(0)
+        except Exception:
+            pass
+        b.setPadding(0, 0, 0, 0)
+        return b
+
+    def _make_loader(self, size):
+        """iOS 八段加载指示器：8 根小段沿圆周排开、整体匀速旋转。
+
+        旋转用 RotateAnimation（定参构造函数，jnius 调得动）；
+        一开始用的是 ObjectAnimator.ofFloat(view, 'rotation', [0, 360])，
+        在真机上会抛异常（jnius 处理不了那个变参签名，实测踩过），
+        所以改成 RotateAnimation。任何一步失败都退回系统 ProgressBar。
+        """
+        size = int(size)
+        frame = FrameLayout(activity)
+        try:
+            n = 8
+            bar_w = max(2, int(size * 0.16))
+            bar_h = max(4, int(size * 0.30))
+            for i in range(n):
+                v = View(activity)
+                v.setBackground(_rounded(C_BLUE, bar_w / 2.0))
+                lp = FrameLayoutLP(bar_w, bar_h,
+                                   Gravity.TOP | Gravity.CENTER_HORIZONTAL)
+                frame.addView(v, lp)
+                # 绕容器中心转到第 i 个位置，透明度依次变淡（追光效果）
+                v.setPivotX(bar_w / 2.0)
+                v.setPivotY(size / 2.0)
+                v.setRotation(i * 45.0)
+                v.setAlpha(1.0 - i * 0.10)
+            anim = RotateAnimation(
+                0.0, 360.0,
+                Anim.RELATIVE_TO_SELF, 0.5,
+                Anim.RELATIVE_TO_SELF, 0.5)
+            anim.setDuration(1000)
+            anim.setRepeatCount(-1)          # Animation.INFINITE
+            anim.setInterpolator(LinearInterpolator())
+            frame.startAnimation(anim)
+            self._loader_anim = anim
+            return frame
+        except Exception:
+            traceback.print_exc()
+            try:
+                pb = ProgressBar(activity)
+                pb.getIndeterminateDrawable().setTint(_c(C_BLUE))
+                return pb
+            except Exception:
+                return frame
+
+    def _icon_typeface(self):
+        """图标字体（lucide.ttf 随包放在 files/app）；拿不到就返回默认字体。"""
+        if self._typeface is not None:
+            return self._typeface
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'lucide.ttf')
+            if os.path.exists(path):
+                self._typeface = Typeface.createFromFile(path)
+                return self._typeface
+        except Exception:
+            traceback.print_exc()
+        self._typeface = Typeface.DEFAULT
+        return self._typeface
+
+    def _icon_glyph(self, name, fallback):
+        """有图标字体就用图标码位，否则退回汉字。"""
+        code = _ICON_GLYPH.get(name)
+        if code and self._icon_typeface() is not Typeface.DEFAULT:
+            return code
+        return fallback
+
+    # ---------------- 状态行 ----------------
+    def _set_status(self, text):
+        """在面板状态行上显示"正在…"（text 为空则隐藏状态行）。"""
+        if self._panel is None:
+            self.show_panel('')
+        self._ui_call(lambda: self._set_status_ui(text))
+
+    @run_on_ui_thread
+    def _set_status_ui(self, text):
+        if self._status_row is None:
+            return
+        if text:
+            self._status_tv.setText(_s(text))
+            self._status_row.setVisibility(View.VISIBLE)
+        else:
+            self._status_row.setVisibility(View.GONE)
 
     def _set_answer(self, text):
         if self._panel is None:
@@ -701,10 +1110,47 @@ class AndroidBridge(object):
             return
         self._set_answer_ui(text)
 
+    def _error_text(self, err):
+        """把异常转成给用户看的一句话。
+
+        全黑那种情况本身就是"说明+替代方案"，前面再挂"错误："会读起来很怪。
+        """
+        msg = str(err)
+        if msg.startswith('画面全黑'):
+            return msg
+        return '错误：' + msg
+
     @run_on_ui_thread
     def _set_answer_ui(self, text):
+        self._panel_text = text
         if self._answer_tv is not None:
             self._answer_tv.setText(_s(text))
+        # 出结果了就把"正在…"状态行收起来
+        if self._status_row is not None:
+            self._status_row.setVisibility(View.GONE)
+
+    def _ui_append(self, text):
+        """把一段文字追加到答案区（追问的问答往后面接）。"""
+        self._ui_call(lambda: self._append_ui(text))
+
+    @run_on_ui_thread
+    def _append_ui(self, text):
+        if self._answer_tv is None:
+            return
+        cur = (self._panel_text or '').strip()
+        if not cur or cur == PANEL_INTRO.strip():
+            self._panel_text = text
+        else:
+            self._panel_text = self._panel_text.rstrip() + '\n\n' + text
+        self._answer_tv.setText(_s(self._panel_text))
+        if self._status_row is not None:
+            self._status_row.setVisibility(View.GONE)
+        # 滚到底部，最新一条才看得见
+        try:
+            if self._answer_sv is not None:
+                self._answer_sv.fullScroll(View.FOCUS_DOWN)
+        except Exception:
+            pass
 
     # ---------------- 剪贴板 ----------------
     def get_clipboard(self):
@@ -808,7 +1254,7 @@ class AndroidBridge(object):
             self.toast('正在处理上一题，请稍候…')
             return
         self._busy = True
-        self.show_panel('正在查找最新截图…')
+        self._set_status('正在查找最新截图…')
         threading.Thread(target=self._latest_shot_worker, daemon=True).start()
 
     def _latest_shot_worker(self):
@@ -836,16 +1282,16 @@ class AndroidBridge(object):
             dst = os.path.join(activity.getCacheDir().getAbsolutePath(),
                                'latest_shot.jpg')
             self._prepare_image(src, dst)
-            self._set_answer('已读到截图，正在识别题目…')
+            self._set_status('正在识别题目…')
             q = ai_core.ocr_question(dst)
-            self._set_answer('已识别题目，正在解答…')
+            self._set_status('正在解答…')
             answer = ai_core.solve_question(q)
             self._last_answer = answer
             # 同截图搜题：题目不用重复贴，只回答案
             self._set_answer('【解答】\n' + ai_core.plain_text(answer))
         except Exception as e:
             traceback.print_exc()
-            self._set_answer('错误：' + str(e))
+            self._set_answer(self._error_text(e))
         finally:
             self._busy = False
 
@@ -874,7 +1320,8 @@ class AndroidBridge(object):
             self.toast('正在处理上一题，请稍候…')
             return
         self._busy = True
-        self.show_panel('正在解答…\n\n【题目】\n' + ai_core.font_safe(question[:400]))
+        self.show_panel('【题目】\n' + ai_core.font_safe(question[:400]))
+        self._set_status('正在解答…')
 
         def worker():
             try:
@@ -885,7 +1332,33 @@ class AndroidBridge(object):
                                  ai_core.plain_text(answer))
             except Exception as e:
                 traceback.print_exc()
-                self._set_answer('错误：' + str(e))
+                self._set_answer(self._error_text(e))
+            finally:
+                self._busy = False
+        threading.Thread(target=worker, daemon=True).start()
+
+    def followup_async(self, question):
+        """追问：接着当前这道题继续问，问答往面板后面接。
+
+        和 solve_text_async 的区别只在 ai_core 那侧 —— 追问问的是
+        followup_question()，会把前面的题目和解答一起带上，
+        所以"为什么选 B"这种问题模型看得懂在问哪道题。
+        """
+        if self._busy:
+            self.toast('正在处理上一题，请稍候…')
+            return
+        self._busy = True
+        self._ui_append('【追问】' + ai_core.font_safe(question))
+        self._set_status('正在追问…')
+
+        def worker():
+            try:
+                answer = ai_core.followup_question(question)
+                self._last_answer = answer
+                self._ui_append('【解答】\n' + ai_core.plain_text(answer))
+            except Exception as e:
+                traceback.print_exc()
+                self._ui_append(self._error_text(e))
             finally:
                 self._busy = False
         threading.Thread(target=worker, daemon=True).start()
@@ -907,7 +1380,8 @@ class AndroidBridge(object):
                             '「② 开启截屏授权」。')
             return
         self._busy = True
-        self.show_panel('正在截图…')
+        self.show_panel('')
+        self._set_status('正在截图…')
         self._ball_visible_ui(False)
         self._panel_visible_ui(False)
         # jnius 对象的 str() 是对象表示，不是路径，必须取绝对路径
@@ -917,16 +1391,16 @@ class AndroidBridge(object):
         def worker():
             try:
                 self._do_capture(path)
-                self._set_answer('正在识别题目…')
+                self._set_status('正在识别题目…')
                 q = ai_core.ocr_question(path)
-                self._set_answer('已识别题目，正在解答…')
+                self._set_status('正在解答…')
                 answer = ai_core.solve_question(q)
                 self._last_answer = answer
                 # 题目就在屏幕上看着，面板又小，只回答案不重复贴题目
                 self._set_answer('【解答】\n' + ai_core.plain_text(answer))
             except Exception as e:
                 traceback.print_exc()
-                self._set_answer('错误：' + str(e))
+                self._set_answer(self._error_text(e))
             finally:
                 self._busy = False
                 self._ball_visible_ui(True)
@@ -961,6 +1435,7 @@ class AndroidBridge(object):
         if self._session_attempted:
             return
         self._session_attempted = True
+        self._had_session = True
         self._release_capture_session()
         sw, sh = self._screen()
         self._reader = ImageReader.newInstance(sw, sh, PixelFormat.RGBA_8888, 2)
@@ -1057,6 +1532,12 @@ class AndroidBridge(object):
                                                            BitmapConfig.ARGB_8888)
                                 full.copyPixelsFromBuffer(buf)
                                 bmp = Bitmap.createBitmap(full, 0, 0, sw, sh)
+                            # 整屏全黑 = 该应用禁止被截屏（系统隐私保护），
+                            # 这种情况再往下发去 OCR 也是白花 token
+                            if self._is_black(bmp):
+                                result['err'] = BLACK_FRAME_HINT
+                                result['black'] = True
+                                return
                             if bmp.getWidth() > 1280:
                                 bmp = Bitmap.createScaledBitmap(
                                     bmp, 1280,
@@ -1087,10 +1568,34 @@ class AndroidBridge(object):
         done.wait(15)
         if result.get('ok'):
             return True
+        if result.get('black'):
+            # 全黑是"该应用禁止截屏"，提示本身就是给用户看的说明，
+            # 不用再套一层"截图失败："前缀
+            raise RuntimeError(result['err'])
         # 千万别在这里关掉会话：Android 14+ 上一个 MediaProjection 只能成功
         # 建一次 VirtualDisplay，关掉就再也建不回来（实测反复重建的结果是
         # 一帧都收不到）。会话留给下一次截图继续用。
         raise RuntimeError('截图失败：' + result.get('err', '超时'))
+
+    def _is_black(self, bmp):
+        """整幅画面几乎全黑 → 基本可以断定该应用禁止被截屏。
+
+        抽点采样（几十次 getPixel），比遍历全图快得多，也不占内存。
+        """
+        try:
+            w, h = bmp.getWidth(), bmp.getHeight()
+            for i in range(1, 9):
+                for j in range(1, 15):
+                    px = bmp.getPixel(int(w * i / 9.0), int(h * j / 15.0))
+                    r = (px >> 16) & 0xFF
+                    g = (px >> 8) & 0xFF
+                    b = px & 0xFF
+                    if r + g + b > 40:      # 有一点亮色就算有内容
+                        return False
+            return True
+        except Exception:
+            traceback.print_exc()
+            return False
 
 
 bridge = AndroidBridge() if ANDROID else None
