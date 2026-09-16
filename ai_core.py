@@ -3,7 +3,7 @@
 
 两条链路：
   1. 截图识题：deepseek-flash 视觉模型，直接传截图(base64)提取题目文字
-  2. 解题：deepseek-chat / deepseek-reasoner 生成答案与解题思路
+  2. 解题：默认也是 deepseek-flash（可在 App 的「API 设置」里换成任意可用模型）
 
 DeepSeek 为 OpenAI 兼容接口，官方文档：
   https://api-docs.deepseek.com/zh-cn/guides/vision/

@@ -149,10 +149,10 @@ if ANDROID:
     class _StopListener(PythonJavaClass):
         """Java 助手 ProjectionCallback.Listener 的 Python 实现。
 
-        为什么绕这一圈：Android 14+ 把 MediaProjection.Callback 从接口改成了
-        抽象类，而 jnius 的 PythonJavaClass 内部用 java.lang.reflect.Proxy，
-        只能实现接口、不能子类化抽象类 —— 所以 Python 侧直接实现它是做不到的
-        （老代码 _PJCallback 把它当接口声明，构造时必然抛异常被吞掉）。
+        为什么绕这一圈：MediaProjection.Callback 在 API 33 中本来就是抽象类，
+        而 jnius 的 PythonJavaClass 内部用 java.lang.reflect.Proxy，只能实现接口、
+        不能子类化抽象类 —— 所以 Python 侧直接实现它在任何 Android 版本上都
+        做不到（老代码 _PJCallback 把它当接口声明，构造时必然抛异常被吞掉）。
         Java 侧 ProjectionCallback 继承 Callback、把 onStop 转发到这个接口上，
         而接口 jnius 是能实现的。
 
@@ -202,8 +202,12 @@ class AndroidBridge(object):
         #: 本次授权是否已经尝试过建会话。Android 14+ 上一个 MediaProjection
         #: 只能成功调用一次 createVirtualDisplay()，所以绝不允许重试建第二个。
         self._session_attempted = False
-        #: MediaProjection.Callback（Java 助手实例），在主线程造好后复用
+        #: 当前 MediaProjection.Callback（每次授权单独创建）
         self._proj_cb = None
+        #: Java 助手类必须在主线程解析；解析后可以复用 Class 引用
+        self._projection_callback_cls = None
+        #: 正在等一次新授权（此时旧投影被回收是正常现象，不该弹提示）
+        self._auth_in_progress = False
         self._mpm = None
         self._service_cls = None
         self._busy = False
@@ -270,8 +274,11 @@ class AndroidBridge(object):
         # 竞争赋值下 self._projection 可能停在已失效的那个上 → 截屏拿不到帧。
         _android_activity.unbind(on_activity_result=self._on_activity_result)
         _android_activity.bind(on_activity_result=self._on_activity_result)
-        # 回调对象在主线程造好（见 _make_projection_callback 的说明）
-        self._make_projection_callback()
+        # 回调对象不在这里造：它绑在"某一个具体投影"上，必须等拿到
+        # MediaProjection 之后再造（见 _register_projection_callback）。
+        # 造在这里还有更坏的后果 —— autoclass 失败会抛异常，把下面这行
+        # startActivityForResult 整个吞掉，用户点「②」时系统对话框不弹、
+        # 界面上也没有任何提示。
         activity.startActivityForResult(self._mpm.createScreenCaptureIntent(),
                                         self.REQUEST_CODE)
 
@@ -281,7 +288,7 @@ class AndroidBridge(object):
         if resultCode != -1 or data is None:
             self.toast('未授予截屏权限')
             return
-        # 【主线程】解析服务类、启动服务、构造回调。
+        # 【主线程】解析服务类并启动前台服务。
         # jnius 的类查找底层是 JNI FindClass，在 threading.Thread 这种
         # 附加线程上会用系统类加载器，看不到本应用的类（实测报
         # ClassNotFoundException: ...ServiceMedcap）。
@@ -292,7 +299,6 @@ class AndroidBridge(object):
         # 【工作线程】前台服务是异步起来的（p4a 的服务要先启动一个
         # Python 解释器，实测 1 秒以上才调 startForeground），
         # 所以轮询重试直到就绪，再取 MediaProjection。
-        # （回调对象已在 _request_projection_ui 里、于主线程造好。）
         threading.Thread(target=self._wait_projection,
                          args=(resultCode, data), daemon=True).start()
 
@@ -320,6 +326,7 @@ class AndroidBridge(object):
         最多约 8 秒），等前台服务真正就绪再取。
         """
         from kivy.logger import Logger
+        self._auth_in_progress = True
         Logger.info('[fojiao] 等待前台服务就绪…')
         proj = None
         err = None
@@ -334,6 +341,7 @@ class AndroidBridge(object):
                 Logger.info('[fojiao] 第 %d 次尚未就绪: %s' % (i + 1, e))
                 time.sleep(1.0)
         if proj is None:
+            self._auth_in_progress = False
             Logger.error('[fojiao] 重试仍未成功: %s' % err)
             self._set_answer(
                 '截屏授权没成功：%s\n\n'
@@ -343,13 +351,26 @@ class AndroidBridge(object):
                 '再点它读图搜题。' % err)
             return
         self._projection = proj
+        # 标记位先清空：只有本次回调注册成功，才允许建立截屏会话
+        # （没有回调 = 系统不送帧，而一个投影只能建一次 VirtualDisplay，
+        #   白建一次就等于这一轮授权彻底废掉）。
+        self._proj_cb = None
         # Android 14+ 必须先注册回调、再 createVirtualDisplay()，否则系统
-        # 不往 ImageReader 送帧。两者都派发到主线程执行，先后有保证。
+        # 不往 ImageReader 送帧。两者都是派发到主线程执行的普通调用，
+        # 同一个 UI 线程队列保证"先注册、后建会话"的顺序。
         self._register_projection_callback(proj)
         # 授权成功就把常驻截屏会话建好（一次就够，之后一直复用），
         # 并直接弹出悬浮球 —— 省掉"回 App 点③再切回来"这一圈。
         self._session_attempted = False
+        # 换授权时要等一下：旧投影的虚拟显示是系统在 onStop 之后异步拆掉的
+        # （实测“释放旧显示”和“新建显示”只差 2ms），紧挨着立刻重建的话，
+        # 新显示 state=ON 却一帧都不送。这里在**工作线程**上等（不能在
+        # 主线程 sleep，会卡住 UI）。
+        if self._reader is not None or self._vd is not None:
+            Logger.info('[fojiao] 换授权：等旧截屏显示拆干净再重建…')
+            time.sleep(1.5)
         self.start_capture_session()
+        self._auth_in_progress = False
         if self.has_overlay_permission():
             try:
                 self.show_ball()
@@ -357,39 +378,55 @@ class AndroidBridge(object):
                 traceback.print_exc()
         self.toast('截屏授权成功，悬浮球已就绪，去刷题吧')
 
-    def _make_projection_callback(self):
-        """(主线程) 造一个 MediaProjection.Callback 实例。
+    @run_on_ui_thread
+    def _register_projection_callback(self, proj):
+        """(主线程) 为"这个具体投影"创建并注册回调。
+
+        回调必须一个投影一个：系统回收旧投影时也会回调它的 onStop，若多个
+        投影共用一个回调对象、又无条件清理状态，就会把刚授权成功的新投影
+        连带作废（重复点「②」会变成"用一次废一次"）。所以这里把 proj 绑进
+        闭包，由 _on_projection_stopped 比对实例。
 
         必须在这条主线程上造：jnius 解析"应用自己的类"要用应用类加载器，
         在 threading.Thread 这种附加线程上会走系统类加载器而找不到。
         """
-        if self._proj_cb is not None:
-            return self._proj_cb
-        listener = _StopListener(self._on_projection_stopped)
-        self._proxies.append(listener)
-        helper = autoclass(_CB_CLASS)(listener)
-        self._proxies.append(helper)
-        self._proj_cb = helper
-        return helper
-
-    @run_on_ui_thread
-    def _register_projection_callback(self, proj):
         try:
-            if self._proj_cb is None:
-                self._make_projection_callback()
-            proj.registerCallback(self._proj_cb, None)
+            if self._projection_callback_cls is None:
+                self._projection_callback_cls = autoclass(_CB_CLASS)
+            listener = _StopListener(lambda: self._on_projection_stopped(proj))
+            # 持有 Java 代理引用防 GC（旧回调也要留住：Java 侧仍可能回调它）
+            self._proxies.append(listener)
+            helper = self._projection_callback_cls(listener)
+            self._proxies.append(helper)
+            proj.registerCallback(helper, None)
+            self._proj_cb = helper
             from kivy.logger import Logger
             Logger.info('[fojiao] 已注册 MediaProjection 回调'
                         '（Android 14+ 缺它系统就不送帧）')
         except Exception:
             traceback.print_exc()
+            from kivy.logger import Logger
+            Logger.error('[fojiao] MediaProjection 回调注册失败，本次无法截屏')
 
-    def _on_projection_stopped(self):
+    def _on_projection_stopped(self, proj=None):
+        """MediaProjection 被系统回收（锁屏/切后台/被新授权顶掉）。
+
+        只有"当前投影"真的没了才清会话；旧投影的回调不能影响新会话。
+        """
+        if proj is not None and self._projection is not None \
+                and proj is not self._projection:
+            from kivy.logger import Logger
+            Logger.info('[fojiao] 旧投影被系统回收（当前会话不受影响）')
+            return
         self._projection = None
         # 截屏会话是跟着投影走的：投影没了会话也作废，重建要等下次授权
         self._ui_call(self._release_capture_session)
         self._session_attempted = False
         self._proj_cb = None
+        if self._auth_in_progress:
+            # 这是"换授权"时旧投影被系统顶掉，属于正常流程，
+            # 不要弹"授权已被回收"吓用户（新会话马上会建好）
+            return
         self._set_answer('注意：截屏授权已被系统回收（锁屏或切后台会触发），'
                          '请回到「佛脚AI搜题」重新点一次「② 开启截屏授权」。')
 
@@ -438,8 +475,7 @@ class AndroidBridge(object):
             except Exception:
                 pass
 
-        # 注意：pyjnius 的 PythonJavaClass 子类底层是 Cython __cinit__，
-        # 不接受关键字参数，必须按位置传（参数顺序见类的 __init__）
+        # 统一按位置传参：(on_tap, on_drag, on_down, on_up, slop)
         tl = _OnTouchListener(self.ball_tap_default, on_drag, on_down, on_up,
                               self._dp(6))
         self._proxies.append(tl)
@@ -575,7 +611,7 @@ class AndroidBridge(object):
             except Exception:
                 pass
 
-        # 同样必须用位置参数：(on_tap, on_drag, on_down, on_up, slop)
+        # 同样按位置传参：(on_tap, on_drag, on_down, on_up, slop)
         tl = _OnTouchListener(None, on_drag, on_down, None, self._dp(8))
         self._proxies.append(tl)
         title.setOnTouchListener(tl)
@@ -939,6 +975,16 @@ class AndroidBridge(object):
     @run_on_ui_thread
     def start_capture_session(self):
         try:
+            # 没有注册成功的回调时不要建会话：系统不送帧，而一个投影只能
+            # 成功建一次 VirtualDisplay，白建一次这一轮授权就废了。
+            if self._proj_cb is None:
+                from kivy.logger import Logger
+                Logger.error('[fojiao] 回调未注册，跳过建立截屏会话')
+                self._set_answer(
+                    '截屏回调注册失败，本次无法截屏。\n\n'
+                    '请重新点一次「② 开启截屏授权」；'
+                    '若一直失败，可先用面板上的【最新截图】。')
+                return
             self._create_capture_session()
         except Exception:
             traceback.print_exc()
@@ -953,6 +999,11 @@ class AndroidBridge(object):
                 # 会话只在授权时建一次（见 _create_capture_session）；
                 # 这里只兜底，且绝不重试建第二个。
                 if self._reader is None and not self._session_attempted:
+                    if self._proj_cb is None:
+                        result['err'] = ('截屏回调没注册成功，系统不会送画面；'
+                                         '请重新点「② 开启截屏授权」')
+                        done.set()
+                        return
                     self._create_capture_session()
                 reader = self._reader
                 sw, sh = self._reader_size
@@ -987,28 +1038,41 @@ class AndroidBridge(object):
                                 '没收到屏幕画面（虚拟显示 %dx%d）。'
                                 '截屏会话可能已被系统回收，'
                                 '请重新点「② 开启截屏授权」' % (sw, sh))
-                        plane = img.getPlanes()[0]
-                        row = plane.getRowStride()
-                        pix = plane.getPixelStride()
-                        buf = plane.getBuffer()
-                        if row == sw * 4 and pix == 4:
-                            bmp = Bitmap.createBitmap(sw, sh, BitmapConfig.ARGB_8888)
-                            bmp.copyPixelsFromBuffer(buf)
-                        else:  # 行对齐填充：先按 stride 建图再裁剪
-                            full = Bitmap.createBitmap(row // 4, sh,
-                                                       BitmapConfig.ARGB_8888)
-                            full.copyPixelsFromBuffer(buf)
-                            bmp = Bitmap.createBitmap(full, 0, 0, sw, sh)
-                        img.close()
-                        if bmp.getWidth() > 1280:
-                            bmp = Bitmap.createScaledBitmap(
-                                bmp, 1280,
-                                int(bmp.getHeight() * 1280 / bmp.getWidth()),
-                                True)
-                        out = FileOutputStream(path)
-                        bmp.compress(BitmapFormat.JPEG, 88, out)
-                        out.close()
-                        result['ok'] = True
+                        # Image 必须在 finally 里关：reader 只开了 2 个缓冲，
+                        # 而会话按设计"绝不重建"，漏掉一个就等于永久少一个
+                        # 缓冲，漏两次之后 acquireLatestImage() 会永远返回
+                        # null（只能重新授权）。而拷贝/转码恰好是最容易抛
+                        # 异常的一段。
+                        try:
+                            plane = img.getPlanes()[0]
+                            row = plane.getRowStride()
+                            pix = plane.getPixelStride()
+                            buf = plane.getBuffer()
+                            if row == sw * 4 and pix == 4:
+                                bmp = Bitmap.createBitmap(sw, sh,
+                                                          BitmapConfig.ARGB_8888)
+                                bmp.copyPixelsFromBuffer(buf)
+                            else:  # 行对齐填充：先按 stride 建图再裁剪
+                                full = Bitmap.createBitmap(row // 4, sh,
+                                                           BitmapConfig.ARGB_8888)
+                                full.copyPixelsFromBuffer(buf)
+                                bmp = Bitmap.createBitmap(full, 0, 0, sw, sh)
+                            if bmp.getWidth() > 1280:
+                                bmp = Bitmap.createScaledBitmap(
+                                    bmp, 1280,
+                                    int(bmp.getHeight() * 1280 /
+                                        bmp.getWidth()), True)
+                            out = FileOutputStream(path)
+                            try:
+                                bmp.compress(BitmapFormat.JPEG, 88, out)
+                            finally:
+                                out.close()
+                            result['ok'] = True
+                        finally:
+                            try:
+                                img.close()
+                            except Exception:
+                                pass
                     except Exception as e:
                         result['err'] = str(e)
                     finally:

@@ -76,18 +76,20 @@ TAP_VALUE = {'截图搜题': 'screenshot', '最新截图': 'shot', '剪贴板搜
 HELP_TEXT = (
     '【使用步骤】\n'
     '1. 到 platform.deepseek.com 注册并创建 API Key，'
-    '在「API 设置」里填入（识图用 deepseek-flash，解题用 deepseek-chat，'
-    '同一个 Key 即可）。\n\n'
+    '在「API 设置」里填入（识图和解题默认都用 deepseek-flash，'
+    '也可以在设置里改模型；同一个 Key 即可）。\n\n'
     '2. 点「申请悬浮窗权限」，在系统设置里允许本应用显示在其他应用上层。\n\n'
     '3. 搜题方式（三选一，可在「API 设置」里改悬浮球点按动作）：\n'
     '   【最新截图】推荐，最省事：先按手机截图快捷键把题目截图'
     '（一般是电源键+音量下，或三指下滑），再点悬浮球，'
     'App 会读相册里最新那张截图去搜题。首次使用需允许读取图片。\n'
-    '   【截图搜题】点悬浮球自动截屏。Android 14 起系统要求截屏'
-    '必须由前台服务承载，本 App 未实现该服务，'
-    '所以点「② 开启截屏授权」可能会失败——失败就改用上面两种。\n'
+    '   【截图搜题】点悬浮球自动截屏。点「② 开启截屏授权」后按系统提示'
+    '选择要共享的应用；授权成功后悬浮球会自动出现。完全杀掉 App 或锁屏后，'
+    '系统会回收授权，需要回来重新点一次「②」。\n'
     '   【剪贴板搜题】长按选中题目文字 → 复制，再点面板里的【读剪贴板】。\n\n'
-    '4. 点「启动悬浮球」回到桌面，打开佛脚刷题，屏幕上会出现蓝色"搜"字悬浮球。\n'
+    '4. 截图授权成功后悬浮球会自动出现；如果选用「最新截图」或'
+    '「剪贴板搜题」，也可点「③ 启动悬浮球」并自动退到后台。'
+    '然后打开佛脚刷题。\n'
     '   · 点一下悬浮球 = 截图搜题（默认）\n'
     '   · 拖动悬浮球 = 移动位置\n'
     '   · 也可以长按题目文字复制后，在面板里点【读剪贴板】\n\n'
@@ -465,9 +467,12 @@ class FojiaoApp(App):
             d = {}
         ai_core.cfg.update({
             'api_key': d.get('api_key', ''),
-            'base_url': d.get('base_url', ai_core.cfg['base_url']),
-            'vision_model': d.get('vision_model', ai_core.cfg['vision_model']),
-            'solve_model': d.get('solve_model', ai_core.cfg['solve_model']),
+            # 用 or 而不是 get 的默认值：旧版本可能存过空串，
+            # 空模型名/空地址发出去就是 400，必须回退到默认值
+            'base_url': d.get('base_url') or ai_core.cfg['base_url'],
+            'vision_model': (d.get('vision_model')
+                             or ai_core.cfg['vision_model']),
+            'solve_model': d.get('solve_model') or ai_core.cfg['solve_model'],
             'think_effort': d.get('think_effort', ai_core.cfg['think_effort']),
             'ocr_prompt': d.get('ocr_prompt', ''),
             'solve_prompt': d.get('solve_prompt', ''),
@@ -504,7 +509,7 @@ class FojiaoApp(App):
             'api_key': s.ids.key.text.strip(),
             'base_url': s.ids.base.text.strip() or ai_core.cfg['base_url'],
             'vision_model': s.ids.vmodel.text.strip() or ai_core.cfg['vision_model'],
-            'solve_model': s.ids.smodel.text,
+            'solve_model': s.ids.smodel.text.strip() or ai_core.cfg['solve_model'],
             'think_effort': EFFORT_VALUE.get(s.ids.effort.text, 'high'),
             'solve_prompt': '' if sprompt == ai_core.DEFAULT_SOLVE_PROMPT.strip()
                             else sprompt,

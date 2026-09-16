@@ -5,10 +5,10 @@ import android.media.projection.MediaProjection;
 /**
  * MediaProjection 回调的 Java 助手。
  *
- * 背景：Android 14 (API 34) 起 MediaProjection.Callback 从「接口」改成了
+ * 背景：MediaProjection.Callback 在本项目使用的 API 33 中本来就是
  * 「抽象类」，而 pyjnius 的 PythonJavaClass 内部靠 java.lang.reflect.Proxy，
- * 只能实现接口、无法子类化抽象类。于是 Python 侧永远拿不到一个可用的
- * Callback 实例。
+ * 只能实现接口、无法子类化抽象类。老代码把 Callback 写进
+ * __javainterfaces__，因此在任何 Android 版本上都拿不到可用实例。
  *
  * 后果不是可选的：Android 14+ 要求 createVirtualDisplay() 之前必须注册回调，
  * 没有回调时系统不往 ImageReader 送帧 —— 实测现象是虚拟显示 state=ON、
