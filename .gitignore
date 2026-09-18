@@ -1,0 +1,9 @@
+.buildozer/
+bin/
+build/
+__pycache__/
+*.pyc
+*.apk
+
+# 构建时由 CI 自动下载（见 .github/workflows/main.yml 的 Download CJK font），不要提交
+NotoSansSC-Regular.otf
