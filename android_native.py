@@ -19,6 +19,7 @@ ANDROID = False
 try:
     from jnius import autoclass, cast, PythonJavaClass, java_method
     from android.runnable import run_on_ui_thread
+    from android.runnable import Runnable as _UiRunnable
     from android import activity as _android_activity
 
     PythonActivity = autoclass('org.kivy.android.PythonActivity')
@@ -52,7 +53,6 @@ try:
     Toast = autoclass('android.widget.Toast')
     FrameLayout = autoclass('android.widget.FrameLayout')
     FrameLayoutLP = autoclass('android.widget.FrameLayout$LayoutParams')
-    ObjectAnimator = autoclass('android.animation.ObjectAnimator')
     LinearInterpolator = autoclass('android.view.animation.LinearInterpolator')
     DecelerateInterpolator = autoclass(
         'android.view.animation.DecelerateInterpolator')
@@ -85,6 +85,23 @@ def _s(text):
 
 def _argb(a, r, g, b):
     return _c((a << 24) | (r << 16) | (g << 8) | b)
+
+
+def _recycle(bmp):
+    """立刻回收一张 Bitmap。
+
+    截屏链路上每张全屏 ARGB_8888（1080x2400）约 10MB，而 App 没开
+    largeHeap，全交给 GC 的话连续搜题十几轮就会把 Java 堆顶到 OOM
+    （表现为先卡顿、后闪退）。这些图都是本地建了马上用完、从不交给
+    View/Drawable，所以可以安全地显式回收。
+    """
+    if bmp is None:
+        return
+    try:
+        if not bmp.isRecycled():
+            bmp.recycle()
+    except Exception:
+        traceback.print_exc()
 
 
 # ---------------- iOS 亮色配色（与 main.py 里的界面配色保持一致）----------------
@@ -291,12 +308,37 @@ class AndroidBridge(object):
         self._resize_base = None
         #: 图标字体 / 加载动画引用
         self._typeface = None
+        #: lucide.ttf 是否真的加载成功（缺字体时要退回汉字，见 _icon_glyph）
+        self._icon_font_ok = False
         self._loader_anim = None
-        self._proxies = []          # 持有 Java 代理对象引用，防 GC
+        self._loader_view = None
+        #: 必须长期活着的 Java 代理（目前只有 MediaProjection 回调）。
+        #: pyjnius 的 PythonJavaClass 不受 Java 侧引用计数保护：上游
+        #: jnius_proxy.pxi 里传给 Java 的是裸 PyObject* 指针，Python 一侧的
+        #: 强引用是它唯一的存在依据。所以只要 Java 侧还可能回调，就得留住，
+        #: 否则回调打到已释放的对象上就是 native 崩溃（Python 看不到 traceback）。
+        self._proxies = []
+        #: 面板的代理：绑在面板控件上，闭包捕获了 root/edit/lp，所以它们
+        #: 同时钉住整棵面板视图树。必须随面板一起释放（关闭时先解绑再清空），
+        #: 否则每关一次面板就永久留下一棵树（实测每轮 +28 个 View）。
+        self._panel_proxies = []
+        #: 悬浮球的代理：同上，随球一起释放
+        self._ball_proxies = []
         self._projection = None
         self._reader = None         # 常驻的截屏 ImageReader
         self._vd = None             # 常驻的 VirtualDisplay
         self._reader_size = (0, 0)
+        #: 保护 _busy 与下面三个读帧状态的小锁。
+        #: 读帧与释放会话必须互斥：read() 线程可能正卡在
+        #: acquireLatestImage()/getPlanes() 上，这时 close(reader) 轻则抛
+        #: IllegalStateException，重则 native 崩溃 —— 所以正在读帧时只打
+        #: "失效"标记，等 read() 收尾后再真正释放。
+        self._lock = threading.Lock()
+        self._capturing = False
+        self._session_dead = False
+        #: 读帧代数：只有"当前这一代"的读线程能清 _capturing（15s 超时后
+        #: 旧线程可能还在跑，它不能把新线程的状态清掉）
+        self._cap_gen = 0
         #: 本次授权是否已经尝试过建会话。Android 14+ 上一个 MediaProjection
         #: 只能成功调用一次 createVirtualDisplay()，所以绝不允许重试建第二个。
         self._session_attempted = False
@@ -326,19 +368,104 @@ class AndroidBridge(object):
             m = activity.getResources().getDisplayMetrics()
             return m.widthPixels, m.heightPixels
 
-    @run_on_ui_thread
     def _toast_ui(self, msg):
+        """(UI 线程) 弹 Toast。"""
         try:
             Toast.makeText(activity, _s(msg), Toast.LENGTH_SHORT).show()
         except Exception:
             traceback.print_exc()
 
     def toast(self, msg):
-        self._toast_ui(msg)
+        self._ui_call(lambda: self._toast_ui(msg))
 
-    @run_on_ui_thread
     def _ui_call(self, fn):
-        fn()
+        """把 fn 丢到 UI 线程执行。
+
+        不能用 @run_on_ui_thread 包一层再转发：p4a 那个装饰器对同一个函数
+        只缓存一个 Runnable 实例，而 Runnable.__call__ 是
+        `self.args = args` 的覆盖式赋值（见
+        _p4a_src/v2024.01.21/.../android/runnable.py:29-33 与 50-53）——
+        前一条消息还没执行、后一条就把它覆盖掉，UI 线程会把后一个 fn 执行
+        两遍、前一个永远丢掉。实测丢过 _release_capture_session，截屏会话
+        因此永不释放。每次新建 Runnable 就没这个问题；p4a 自己会用
+        Runnable.__runnables__ 把实例撑到执行完为止。
+
+        返回 True/False 表示"有没有成功派发出去"。调用方如果是在等一个
+        事件（比如 _do_capture 的 done），必须看这个返回值：派发失败时
+        没人会去 set 那个事件，干等只会等到超时和一条误导性的错误。
+        """
+        if not ANDROID:
+            fn()
+            return True
+        try:
+            _UiRunnable(fn)()
+            return True
+        except Exception:
+            traceback.print_exc()
+            return False
+
+    def _claim_busy(self):
+        """抢"正在处理"标记，抢到返回 True（连点时不放两路并发跑）。"""
+        with self._lock:
+            if self._busy:
+                return False
+            self._busy = True
+            return True
+
+    def _release_busy(self):
+        with self._lock:
+            self._busy = False
+
+    @staticmethod
+    def _unbind(view, kind='click'):
+        """把控件上的监听器摘掉（关面板/收悬浮球时用）。
+
+        必须做：那些代理的闭包捕获了整棵面板树，而 pyjnius 不保证 Java 侧
+        持有代理期间 Python 对象不被回收，所以要"先解绑、再丢引用"。
+        jnius 对接口参数传 None 会命中重载并置成 null jobject
+        （jnius_utils.pxi 的 calculate_score 里 `if arg is None: score += 10`、
+        jnius_conversion.pxi 的 populate_args 里 `if py_arg is None:
+        j_args[index].l = NULL`），不需要 cast。
+        """
+        if view is None:
+            return
+        try:
+            if kind == 'touch':
+                view.setOnTouchListener(None)
+            else:
+                view.setOnClickListener(None)
+        except Exception:
+            traceback.print_exc()
+
+    def _drop_panel_refs(self):
+        """(UI 线程) 丢掉面板相关的一切强引用 —— 这一步才真正让视图树可回收。
+
+        调用前必须先 removeView + 解绑监听（见 _build_panel 里的 _close）。
+        这里会清空 _panel_proxies，而"正在执行的那个回调代理"由当前调用栈
+        持有，所以从回调内部调用是安全的；但顺序绝不能颠倒成
+        "先清引用、再解绑"（那样 Java 侧回调会打到已释放的对象上）。
+        """
+        if self._loader_anim is not None:
+            try:
+                self._loader_anim.cancel()   # setRepeatCount(-1)：不取消就永不结束
+            except Exception:
+                pass
+            self._loader_anim = None
+        if self._loader_view is not None:
+            try:
+                self._loader_view.clearAnimation()
+            except Exception:
+                pass
+            self._loader_view = None
+        self._panel = None
+        self._panel_lp = None
+        self._answer_tv = None
+        self._edit = None
+        self._status_row = None
+        self._status_tv = None
+        self._answer_sv = None
+        self._panel_text = ''
+        self._panel_proxies = []
 
     # ---------------- 权限 ----------------
     def has_overlay_permission(self):
@@ -610,9 +737,19 @@ class AndroidBridge(object):
         # 统一按位置传参：(on_tap, on_drag, on_down, on_up, slop)
         tl = _OnTouchListener(self.ball_tap_default, on_drag, on_down, on_up,
                               self._dp(6))
-        self._proxies.append(tl)
+        self._ball_proxies = [tl]
         root.setOnTouchListener(tl)
-        self._wm.addView(root, lp)
+        try:
+            self._wm.addView(root, lp)
+        except Exception:
+            # 之前这里是裸调用：失败会被 p4a 的 Runnable.run 里那个裸 except
+            # 吞成一行 traceback，用户只看到"点球没反应"
+            traceback.print_exc()
+            from kivy.logger import Logger
+            Logger.error('[fojiao] 悬浮球添加窗口失败（悬浮窗权限被收回？）')
+            self._unbind(root, 'touch')
+            self._ball_proxies = []
+            return
 
         # 入场：淡入 + 轻微放大
         root.setAlpha(0.0)
@@ -631,17 +768,27 @@ class AndroidBridge(object):
                 self._wm.removeView(self._ball)
             except Exception:
                 pass
+            # 顺序要紧：先解绑监听，再丢代理引用（理由见 _unbind）
+            self._unbind(self._ball, 'touch')
             self._ball = None
             self._ball_lp = None
+            self._ball_proxies = []
 
-    @run_on_ui_thread
     def _ball_visible_ui(self, visible):
+        """显隐悬浮球（线程无关：内部派发到 UI 线程）。"""
+        self._ui_call(lambda: self._apply_ball_visible(visible))
+
+    def _apply_ball_visible(self, visible):
+        """(UI 线程) 真正的显隐。"""
         if self._ball is not None:
             self._ball.setVisibility(View.VISIBLE if visible else View.INVISIBLE)
 
-    @run_on_ui_thread
     def _panel_visible_ui(self, visible):
-        # 截图时把面板也藏起来，避免被截进画面
+        """显隐面板（截图时把面板也藏起来，避免被截进画面）。"""
+        self._ui_call(lambda: self._apply_panel_visible(visible))
+
+    def _apply_panel_visible(self, visible):
+        """(UI 线程) 真正的显隐。"""
         if self._panel is not None:
             self._panel.setVisibility(View.VISIBLE if visible else View.INVISIBLE)
 
@@ -651,17 +798,19 @@ class AndroidBridge(object):
 
     # ---------------- 悬浮答案面板 ----------------
     def show_panel(self, text=''):
-        self._show_panel_ui(text)
+        self._ui_call(lambda: self._show_panel_ui(text))
 
-    @run_on_ui_thread
     def _show_panel_ui(self, text):
+        """(UI 线程) 建/显示面板；text 非空则整段替换答案区。"""
         if self._panel is None:
             self._build_panel()
         if self._panel is not None:
             self._panel.setVisibility(View.VISIBLE)
         if text:
             if self._answer_tv is not None:
-                self._answer_tv.setText(_s(text))
+                # 同步 Python 侧持有的全文，否则后续追问会拼到旧文本上
+                self._panel_text = self._clip_panel_text(text)
+                self._answer_tv.setText(_s(self._panel_text))
             # 有结果了就收起"正在…"
             if self._status_row is not None:
                 self._status_row.setVisibility(View.GONE)
@@ -672,6 +821,8 @@ class AndroidBridge(object):
         面板会挡住题目，所以标题栏上放了一个"拖动改大小"的手柄：
         拖它就能把面板收小/放大，尺寸在本次运行内记住（关掉再开还是这个大小）。
         """
+        # 本轮新建的代理都收在这里，关面板时一起丢（见 _panel_proxies 的说明）
+        self._panel_proxies = []
         sw, sh = self._screen()
         if self._panel_size:
             pw, ph = self._panel_size
@@ -685,7 +836,9 @@ class AndroidBridge(object):
         root.setBackground(_rounded(0xFFFFFFFF, self._dp(20)))
         root.setPadding(self._dp(16), self._dp(12), self._dp(16), self._dp(14))
 
-        # 标题栏（拖动区）+ 改大小 + 最小化 + 关闭
+        # 标题栏（拖动区）+ 改大小 + 关闭
+        # （原来的「—」最小化按钮已删：每次点开悬浮球都是一道新题，
+        #   关面板只留 × 一个出口，路径更短、也不会留下隐藏的面板窗口）
         title = LinearLayout(activity)
         title.setOrientation(LinearLayout.HORIZONTAL)
         title.setGravity(Gravity.CENTER_VERTICAL)
@@ -696,10 +849,8 @@ class AndroidBridge(object):
         tv.setTypeface(Typeface.DEFAULT_BOLD)
         title.addView(tv, LLLP(0, -2, 1.0))
         btn_resize = self._icon_btn('resize', '↘')
-        btn_min = self._round_icon_btn('—')
         btn_close = self._round_icon_btn('×')
         title.addView(btn_resize, self._lp(self._dp(30), self._dp(30), 0, 8))
-        title.addView(btn_min, self._lp(self._dp(30), self._dp(30), 0, 8))
         title.addView(btn_close, self._lp(self._dp(30), self._dp(30)))
         root.addView(title, LLLP(-1, -2))
 
@@ -713,6 +864,7 @@ class AndroidBridge(object):
         srow.setGravity(Gravity.CENTER_VERTICAL)
         srow.setPadding(0, self._dp(10), 0, 0)
         loader = self._make_loader(self._dp(16))
+        # _loader_view 到 addView 成功后再赋值（失败时不留指向未挂上视图的引用）
         srow.addView(loader, LLLP(self._dp(16), self._dp(16)))
         stv = TextView(activity)
         stv.setTextColor(_argb(255, 142, 142, 147))
@@ -736,8 +888,8 @@ class AndroidBridge(object):
         ans.setPadding(0, self._dp(10), 0, self._dp(10))
         sv.addView(ans)
         root.addView(sv, LLLP(-1, 0, 1.0))
-        self._panel_text = PANEL_INTRO
-        self._answer_sv = sv
+        # _panel_text / _answer_sv 留到 addView 成功后再赋值：失败时不能留下
+        # 指向那棵没挂上的视图树的引用
 
         # 输入行：药丸形输入框（点它直接弹键盘）+ 圆形「问」
         # 两者都 44dp 高、垂直居中，间距 10dp —— 尺寸不齐会很显眼
@@ -803,7 +955,7 @@ class AndroidBridge(object):
 
         # 同样按位置传参：(on_tap, on_drag, on_down, on_up, slop)
         tl = _OnTouchListener(None, on_drag, on_down, None, self._dp(8))
-        self._proxies.append(tl)
+        self._panel_proxies.append(tl)
         title.setOnTouchListener(tl)
 
         # 标题栏上那个手柄：拖它改面板大小（左上角固定，往右下扩）
@@ -824,7 +976,7 @@ class AndroidBridge(object):
 
         rl = _OnTouchListener(None, on_resize_drag, on_resize_down, None,
                               self._dp(4))
-        self._proxies.append(rl)
+        self._panel_proxies.append(rl)
         btn_resize.setOnTouchListener(rl)
         # 手柄只是用来拖的，点它别去触发"最小化"之类的行为
         btn_resize.setClickable(False)
@@ -852,18 +1004,31 @@ class AndroidBridge(object):
                 traceback.print_exc()
 
         def _close():
+            """关面板并把它占的东西全部还回去。
+
+            顺序不能改：
+              1) removeView —— 先断开 Java 侧对视图的持有（窗口没了，
+                 View 树才可能被回收）
+              2) 解绑各控件的监听 —— 代理的闭包捕获了 root/edit/lp，
+                 只要还有控件引用着代理，整棵树就活着；而 pyjnius 不保证
+                 Java 侧持有期间 Python 对象不被回收，所以必须解绑在前
+              3) _drop_panel_refs() —— 停掉无限加载动画、清空成员、
+                 最后丢掉代理引用，整棵面板树这时才可回收
+            """
             try:
                 self._wm.removeView(root)
             except Exception:
                 pass
-            self._panel = None
-            self._panel_lp = None
-            self._answer_tv = None
-            self._edit = None
-            self._status_row = None
-            self._status_tv = None
-            self._answer_sv = None
-            self._panel_text = ''
+            for v, k in ((title, 'touch'), (btn_resize, 'touch'),
+                         (edit, 'click')):
+                self._unbind(v, k)
+            for b in (btn_close, btn_send, btn_clip, btn_shot, btn_latest,
+                      btn_copy):
+                self._unbind(b)
+            self._drop_panel_refs()
+            from kivy.logger import Logger
+            Logger.info('[fojiao] 面板已关闭并释放（长期代理仍有 %d 个）'
+                        % len(self._proxies))
 
         def _read_clip():
             # 面板窗口可获焦，点这个按钮的瞬间焦点已在面板上，
@@ -907,35 +1072,54 @@ class AndroidBridge(object):
             else:
                 self.toast('还没有可复制的答案')
 
-        for btn, cb in ((btn_min, lambda: root.setVisibility(View.GONE)),
-                        (btn_close, _close),
+        for btn, cb in ((btn_close, _close),
                         (btn_send, _send),
                         (btn_clip, _read_clip),
                         (btn_shot, self.capture_and_solve),
                         (btn_latest, self.solve_from_latest_shot),
                         (btn_copy, _copy)):
             p = _OnClickListener(cb)
-            self._proxies.append(p)
+            self._panel_proxies.append(p)
             btn.setOnClickListener(p)
 
         # 点输入框直接弹键盘（原来是旁边一个「键盘」按钮，去掉了）
         kbd = _OnClickListener(_show_keyboard)
-        self._proxies.append(kbd)
+        self._panel_proxies.append(kbd)
         edit.setOnClickListener(kbd)
 
-        self._wm.addView(root, lp)
+        try:
+            self._wm.addView(root, lp)
+        except Exception:
+            # 之前是裸调用：失败会被 p4a 的 Runnable.run 里那个裸 except
+            # 吞成一行 traceback，用户只看到"点球没反应"
+            traceback.print_exc()
+            from kivy.logger import Logger
+            Logger.error('[fojiao] 面板添加窗口失败（悬浮窗权限被收回？）')
+            for v, k in ((title, 'touch'), (btn_resize, 'touch'), (edit, 'click'),
+                         (btn_close, 'click'), (btn_send, 'click'),
+                         (btn_clip, 'click'), (btn_shot, 'click'),
+                         (btn_latest, 'click'), (btn_copy, 'click')):
+                self._unbind(v, k)
+            self._drop_panel_refs()
+            return
         self._panel = root
         self._panel_lp = lp
         self._answer_tv = ans
         self._edit = edit
         self._status_row = srow
         self._status_tv = stv
+        self._panel_text = PANEL_INTRO
+        self._answer_sv = sv
+        self._loader_view = loader
 
         # 入场：淡入 + 轻微上浮
         root.setAlpha(0.0)
         root.setTranslationY(float(self._dp(10)))
         root.animate().alpha(1.0).translationY(0.0).setDuration(
             220).setInterpolator(DecelerateInterpolator()).start()
+        from kivy.logger import Logger
+        Logger.info('[fojiao] 面板已建立（本轮 %d 个代理，视图约 %d 个）'
+                    % (len(self._panel_proxies), root.getChildCount()))
 
     # ---------------- 组件工厂 ----------------
     def _lp(self, w, h, weight=0.0, margin=0):
@@ -1031,6 +1215,14 @@ class AndroidBridge(object):
         """
         size = int(size)
         frame = FrameLayout(activity)
+        # 上一轮的动画别留着：如果上一次建面板在 addView 之前就抛了异常，
+        # 这里只是丢掉引用是不会停掉那个 setRepeatCount(-1) 的动画的
+        if self._loader_anim is not None:
+            try:
+                self._loader_anim.cancel()
+            except Exception:
+                pass
+            self._loader_anim = None
         try:
             n = 8
             bar_w = max(2, int(size * 0.16))
@@ -1074,16 +1266,23 @@ class AndroidBridge(object):
                                 'lucide.ttf')
             if os.path.exists(path):
                 self._typeface = Typeface.createFromFile(path)
+                self._icon_font_ok = True
                 return self._typeface
         except Exception:
             traceback.print_exc()
         self._typeface = Typeface.DEFAULT
+        self._icon_font_ok = False
         return self._typeface
 
     def _icon_glyph(self, name, fallback):
         """有图标字体就用图标码位，否则退回汉字。"""
+        # 必须先解析一次字体：_icon_font_ok 是在 _icon_typeface() 里点亮的，
+        # 而调用方都是"先取 glyph、再 setTypeface"。不在这里先点亮的话，
+        # 进程内第一次会返回 fallback 汉字，却仍被套上 lucide 字体
+        # （汉字在 lucide 里没有字形 → 渲染成豆腐块）
+        self._icon_typeface()
         code = _ICON_GLYPH.get(name)
-        if code and self._icon_typeface() is not Typeface.DEFAULT:
+        if code and self._icon_font_ok:
             return code
         return fallback
 
@@ -1094,8 +1293,8 @@ class AndroidBridge(object):
             self.show_panel('')
         self._ui_call(lambda: self._set_status_ui(text))
 
-    @run_on_ui_thread
     def _set_status_ui(self, text):
+        """(UI 线程，由 _ui_call 派发) 刷新"正在…"状态行。"""
         if self._status_row is None:
             return
         if text:
@@ -1108,7 +1307,7 @@ class AndroidBridge(object):
         if self._panel is None:
             self.show_panel(text)
             return
-        self._set_answer_ui(text)
+        self._ui_call(lambda: self._set_answer_ui(text))
 
     def _error_text(self, err):
         """把异常转成给用户看的一句话。
@@ -1120,11 +1319,11 @@ class AndroidBridge(object):
             return msg
         return '错误：' + msg
 
-    @run_on_ui_thread
     def _set_answer_ui(self, text):
-        self._panel_text = text
+        """(UI 线程，由 _ui_call 派发) 整段替换答案区。"""
+        self._panel_text = self._clip_panel_text(text)
         if self._answer_tv is not None:
-            self._answer_tv.setText(_s(text))
+            self._answer_tv.setText(_s(self._panel_text))
         # 出结果了就把"正在…"状态行收起来
         if self._status_row is not None:
             self._status_row.setVisibility(View.GONE)
@@ -1133,8 +1332,33 @@ class AndroidBridge(object):
         """把一段文字追加到答案区（追问的问答往后面接）。"""
         self._ui_call(lambda: self._append_ui(text))
 
-    @run_on_ui_thread
+    #: 面板全文上限。追问越多、拼出来的问答越长，而每次刷新都是整段
+    #: setText 重排（ScrollView 还开着 FillViewport），长到几万字会明显卡。
+    _PANEL_TEXT_LIMIT = 20000
+
+    @classmethod
+    def _clip_panel_text(cls, text):
+        """超长只留尾部 —— 最新的问答才是有用的。"""
+        if len(text) <= cls._PANEL_TEXT_LIMIT:
+            return text
+        return ('（前面的内容太长，已省略）\n\n'
+                + text[-cls._PANEL_TEXT_LIMIT:])
+
+    def _reset_answer_area(self):
+        """新题目开始时复位答案区：每次点开悬浮球都是一道新题。"""
+        self._ui_call(self._reset_answer_ui)
+
+    def _reset_answer_ui(self):
+        """(UI 线程，由 _ui_call 派发) 复位成引导语。"""
+        if self._answer_tv is None:
+            return
+        self._panel_text = PANEL_INTRO
+        self._answer_tv.setText(_s(PANEL_INTRO))
+        if self._status_row is not None:
+            self._status_row.setVisibility(View.GONE)
+
     def _append_ui(self, text):
+        """(UI 线程，由 _ui_call 派发) 往答案区追加一段。"""
         if self._answer_tv is None:
             return
         cur = (self._panel_text or '').strip()
@@ -1142,6 +1366,7 @@ class AndroidBridge(object):
             self._panel_text = text
         else:
             self._panel_text = self._panel_text.rstrip() + '\n\n' + text
+        self._panel_text = self._clip_panel_text(self._panel_text)
         self._answer_tv.setText(_s(self._panel_text))
         if self._status_row is not None:
             self._status_row.setVisibility(View.GONE)
@@ -1239,23 +1464,39 @@ class AndroidBridge(object):
         bmp = BitmapFactory.decodeFile(src_path)
         if bmp is None:
             raise RuntimeError('无法读取图片（可能没有相册权限）：' + src_path)
-        w, h = bmp.getWidth(), bmp.getHeight()
-        if w > max_w:
-            bmp = Bitmap.createScaledBitmap(bmp, max_w,
-                                            int(h * max_w / float(w)), True)
-        out = FileOutputStream(dst_path)
-        bmp.compress(BitmapFormat.JPEG, 88, out)
-        out.close()
+        made = [bmp]
+        try:
+            w, h = bmp.getWidth(), bmp.getHeight()
+            if w > max_w:
+                # 按原始分辨率解出来的那张很大（1440x3200 约 18MB），
+                # 缩放完就用不上了，和缩放图一起在 finally 里回收
+                small = Bitmap.createScaledBitmap(bmp, max_w,
+                                                  int(h * max_w / float(w)),
+                                                  True)
+                made.append(small)
+                bmp = small
+            out = FileOutputStream(dst_path)
+            try:
+                bmp.compress(BitmapFormat.JPEG, 88, out)
+            finally:
+                out.close()
+        finally:
+            for b in made:
+                _recycle(b)
         return dst_path
 
     def solve_from_latest_shot(self):
         """读相册里最新的一张截图去搜题。"""
-        if self._busy:
+        if not self._claim_busy():
             self.toast('正在处理上一题，请稍候…')
             return
-        self._busy = True
-        self._set_status('正在查找最新截图…')
-        threading.Thread(target=self._latest_shot_worker, daemon=True).start()
+        try:
+            self._set_status('正在查找最新截图…')
+            threading.Thread(target=self._latest_shot_worker,
+                             daemon=True).start()
+        except Exception:
+            traceback.print_exc()      # 起不了线程就别把 _busy 留着
+            self._release_busy()
 
     def _latest_shot_worker(self):
         try:
@@ -1293,7 +1534,7 @@ class AndroidBridge(object):
             traceback.print_exc()
             self._set_answer(self._error_text(e))
         finally:
-            self._busy = False
+            self._release_busy()
 
     # ---------------- 搜题主流程 ----------------
     def ball_tap_default(self):
@@ -1316,12 +1557,16 @@ class AndroidBridge(object):
             self.capture_and_solve()
 
     def solve_text_async(self, question):
-        if self._busy:
+        if not self._claim_busy():
             self.toast('正在处理上一题，请稍候…')
             return
-        self._busy = True
-        self.show_panel('【题目】\n' + ai_core.font_safe(question[:400]))
-        self._set_status('正在解答…')
+        try:
+            self.show_panel('【题目】\n' + ai_core.font_safe(question[:400]))
+            self._set_status('正在解答…')
+        except Exception:
+            traceback.print_exc()      # 别把 _busy 永久留下
+            self._release_busy()
+            return
 
         def worker():
             try:
@@ -1334,8 +1579,12 @@ class AndroidBridge(object):
                 traceback.print_exc()
                 self._set_answer(self._error_text(e))
             finally:
-                self._busy = False
-        threading.Thread(target=worker, daemon=True).start()
+                self._release_busy()
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            traceback.print_exc()      # 起不了线程就别把 _busy 留着
+            self._release_busy()
 
     def followup_async(self, question):
         """追问：接着当前这道题继续问，问答往面板后面接。
@@ -1344,12 +1593,16 @@ class AndroidBridge(object):
         followup_question()，会把前面的题目和解答一起带上，
         所以"为什么选 B"这种问题模型看得懂在问哪道题。
         """
-        if self._busy:
+        if not self._claim_busy():
             self.toast('正在处理上一题，请稍候…')
             return
-        self._busy = True
-        self._ui_append('【追问】' + ai_core.font_safe(question))
-        self._set_status('正在追问…')
+        try:
+            self._ui_append('【追问】' + ai_core.font_safe(question))
+            self._set_status('正在追问…')
+        except Exception:
+            traceback.print_exc()      # 别把 _busy 永久留下
+            self._release_busy()
+            return
 
         def worker():
             try:
@@ -1360,13 +1613,14 @@ class AndroidBridge(object):
                 traceback.print_exc()
                 self._ui_append(self._error_text(e))
             finally:
-                self._busy = False
-        threading.Thread(target=worker, daemon=True).start()
+                self._release_busy()
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            traceback.print_exc()      # 起不了线程就别把 _busy 留着
+            self._release_busy()
 
     def capture_and_solve(self):
-        if self._busy:
-            self.toast('正在处理上一题，请稍候…')
-            return
         if self._projection is None:
             # 注意：App 在后台时系统会拦截 Toast（实测 Android 15 会打日志
             # "Suppressing toast from package ... by user request"），
@@ -1379,14 +1633,26 @@ class AndroidBridge(object):
                             '要尝试截屏授权：回到「佛脚AI搜题」点'
                             '「② 开启截屏授权」。')
             return
-        self._busy = True
-        self.show_panel('')
-        self._set_status('正在截图…')
-        self._ball_visible_ui(False)
-        self._panel_visible_ui(False)
-        # jnius 对象的 str() 是对象表示，不是路径，必须取绝对路径
-        path = os.path.join(activity.getCacheDir().getAbsolutePath(),
-                            'fojiao_shot.jpg')
+        if not self._claim_busy():
+            self.toast('正在处理上一题，请稍候…')
+            return
+        try:
+            self.show_panel('')
+            self._reset_answer_area()      # 新题目：把上一题的答案清掉
+            self._set_status('正在截图…')
+            self._ball_visible_ui(False)
+            self._panel_visible_ui(False)
+            # jnius 对象的 str() 是对象表示，不是路径，必须取绝对路径
+            path = os.path.join(activity.getCacheDir().getAbsolutePath(),
+                                'fojiao_shot.jpg')
+        except Exception:
+            # 准备阶段出错必须把 _busy 还回去：否则用户会永久看到
+            # "正在处理上一题"，而且球和面板已经被藏起来了
+            traceback.print_exc()
+            self._release_busy()
+            self._ball_visible_ui(True)
+            self._panel_visible_ui(True)
+            return
 
         def worker():
             try:
@@ -1402,14 +1668,36 @@ class AndroidBridge(object):
                 traceback.print_exc()
                 self._set_answer(self._error_text(e))
             finally:
-                self._busy = False
+                self._release_busy()
                 self._ball_visible_ui(True)
                 self._panel_visible_ui(True)
-        threading.Thread(target=worker, daemon=True).start()
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            # 起不了线程时必须还回 _busy 并把刚藏起来的球/面板恢复，
+            # 否则用户界面全空、只能重开 App
+            traceback.print_exc()
+            self._release_busy()
+            self._ball_visible_ui(True)
+            self._panel_visible_ui(True)
 
     # ---------------- MediaProjection 截屏 ----------------
     def _release_capture_session(self):
-        """(主线程) 关掉常驻的 reader / virtual display。"""
+        """(主线程) 关掉常驻的 reader / virtual display。
+
+        正在读帧时不能关：read() 线程可能正卡在 acquireLatestImage() /
+        getPlanes() 上，关掉它轻则抛 IllegalStateException，重则 native
+        崩溃（Python 侧连 traceback 都看不到，正是"偶现闪退"的形态）。
+        所以这时只打"失效"标记，等 read() 自己的 finally 收尾再真正释放。
+        """
+        with self._lock:
+            if self._capturing:
+                self._session_dead = True
+                return
+        self._close_capture_session()
+
+    def _close_capture_session(self):
+        """(主线程) 真正 close 掉 reader / virtual display。"""
         for attr in ('_vd', '_reader'):
             obj = getattr(self, attr, None)
             if obj is None:
@@ -1436,14 +1724,21 @@ class AndroidBridge(object):
             return
         self._session_attempted = True
         self._had_session = True
-        self._release_capture_session()
+        self._session_dead = False
+        # 建新会话前必须把旧的真的关掉（硬释放：此刻不可能在读帧）
+        self._close_capture_session()
         sw, sh = self._screen()
-        self._reader = ImageReader.newInstance(sw, sh, PixelFormat.RGBA_8888, 2)
-        self._vd = self._projection.createVirtualDisplay(
+        # 先建成局部变量，两步都成功了才写进 self：createVirtualDisplay 抛错时
+        # 不会留下"reader 已赋值、_reader_size 还是旧值"的半成品状态
+        # （那会让后续读帧走进 row//4 x 0 的非法分支，报出与真实原因无关的错）
+        reader = ImageReader.newInstance(sw, sh, PixelFormat.RGBA_8888, 2)
+        vd = self._projection.createVirtualDisplay(
             'fojiao-cap', sw, sh, self._dpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            self._reader.getSurface(), None, None)
+            reader.getSurface(), None, None)
+        self._reader = reader
         self._reader_size = (sw, sh)
+        self._vd = vd
         from kivy.logger import Logger
         Logger.info('[fojiao] 截屏会话已建立 %dx%d（此后一直复用）' % (sw, sh))
 
@@ -1468,9 +1763,22 @@ class AndroidBridge(object):
         result = {}
         done = threading.Event()
 
-        @run_on_ui_thread
         def start():
+            """(UI 线程，由 _ui_call 派发) 起一个读帧线程并等它收尾。
+
+            这里刻意不用 @run_on_ui_thread：那个装饰器是拿**函数对象**当 key
+            永久缓存 Runnable 的（见 _p4a_src/.../android/runnable.py:14,50-53），
+            而 start 是每次截图新建的闭包 —— 等于每截一次图就往
+            __functionstable__ 里塞一项，永不清理，还各带一个 JNI global ref。
+            走 _ui_call 语义一样（异步 post），但不留垃圾。
+            """
             try:
+                # 会话已被判定失效（投影被系统回收、释放被推迟到读帧结束）
+                if self._session_dead:
+                    result['err'] = ('截屏会话已失效（截屏授权被系统回收），'
+                                     '请重新点「② 开启截屏授权」')
+                    done.set()
+                    return
                 # 会话只在授权时建一次（见 _create_capture_session）；
                 # 这里只兜底，且绝不重试建第二个。
                 if self._reader is None and not self._session_attempted:
@@ -1486,6 +1794,18 @@ class AndroidBridge(object):
                     result['err'] = '截屏会话没建起来，请重新点「② 开启截屏授权」'
                     done.set()
                     return
+                # "正在读帧"必须在**起线程之前**、在这条 UI 线程上置位：
+                # 否则新线程还没拿到 GIL 时投影就被回收，_release_capture_session
+                # 会看到 _capturing=False 而直接 close(reader)，读线程随后操作
+                # 已关闭的 ImageReader —— 正是那种没有 traceback 的 native 崩溃。
+                with self._lock:
+                    if self._capturing:
+                        result['err'] = '上一次截图还没收尾，请稍候再试'
+                        done.set()
+                        return
+                    self._cap_gen += 1
+                    gen = self._cap_gen
+                    self._capturing = True
 
                 def read():
                     try:
@@ -1518,6 +1838,11 @@ class AndroidBridge(object):
                         # 缓冲，漏两次之后 acquireLatestImage() 会永远返回
                         # null（只能重新授权）。而拷贝/转码恰好是最容易抛
                         # 异常的一段。
+                        # 本轮建的每张 Bitmap 都登记下来，回收统一放在
+                        # finally 里 —— 必须在 _is_black() 和 compress()
+                        # 之后（_is_black 是 except 吞异常的，图被提前
+                        # 回收的话黑屏检测会静默失效）
+                        made = []
                         try:
                             plane = img.getPlanes()[0]
                             row = plane.getRowStride()
@@ -1526,12 +1851,18 @@ class AndroidBridge(object):
                             if row == sw * 4 and pix == 4:
                                 bmp = Bitmap.createBitmap(sw, sh,
                                                           BitmapConfig.ARGB_8888)
+                                made.append(bmp)
                                 bmp.copyPixelsFromBuffer(buf)
                             else:  # 行对齐填充：先按 stride 建图再裁剪
                                 full = Bitmap.createBitmap(row // 4, sh,
                                                            BitmapConfig.ARGB_8888)
+                                made.append(full)
                                 full.copyPixelsFromBuffer(buf)
+                                # 源图是可变图且尺寸不同，这里必定是新对象
+                                # （AOSP createBitmap 的"原样返回"只对不可变
+                                # 且整幅裁剪生效），所以两张都能回收
                                 bmp = Bitmap.createBitmap(full, 0, 0, sw, sh)
+                                made.append(bmp)
                             # 整屏全黑 = 该应用禁止被截屏（系统隐私保护），
                             # 这种情况再往下发去 OCR 也是白花 token
                             if self._is_black(bmp):
@@ -1543,6 +1874,7 @@ class AndroidBridge(object):
                                     bmp, 1280,
                                     int(bmp.getHeight() * 1280 /
                                         bmp.getWidth()), True)
+                                made.append(bmp)
                             out = FileOutputStream(path)
                             try:
                                 bmp.compress(BitmapFormat.JPEG, 88, out)
@@ -1550,6 +1882,10 @@ class AndroidBridge(object):
                                 out.close()
                             result['ok'] = True
                         finally:
+                            # 全屏 ARGB_8888 一张约 10MB，不回收的话连续搜题
+                            # 十几轮就把 Java 堆顶到 OOM（先卡后崩）
+                            for b in made:
+                                _recycle(b)
                             try:
                                 img.close()
                             except Exception:
@@ -1557,14 +1893,45 @@ class AndroidBridge(object):
                     except Exception as e:
                         result['err'] = str(e)
                     finally:
-                        # 这里不能关 reader/vd —— 会话要留给下一次截图用
+                        # 这里不能关 reader/vd —— 会话要留给下一次截图用。
+                        # 但如果读帧期间投影被回收（那时 _release 只打了失效
+                        # 标记、没敢关），现在必须由我们收尾，否则 reader/vd
+                        # 就一直漏着。
+                        with self._lock:
+                            # 只有自己那一代才能清标志：15s 超时后旧线程可能
+                            # 还在跑，不能把新线程的"正在读帧"清掉
+                            owned = (self._cap_gen == gen)
+                            if owned:
+                                self._capturing = False
+                            dead = self._session_dead
+                            self._session_dead = False
+                        if owned and dead:
+                            # 必须再走一次 _release_capture_session（而不是直接
+                            # _close_capture_session）：从上面解锁到这里，UI 线程
+                            # 可能已经处理了一条新的截图请求并把 _capturing 又
+                            # 置成了 True —— 直接 close 就会在别人读帧时把
+                            # reader 关掉（native 崩溃）。交给守卫重新判断：
+                            # 真的没人读才关，否则再打一次失效标记给新线程收尾。
+                            self._ui_call(self._release_capture_session)
                         done.set()
-                threading.Thread(target=read, daemon=True).start()
+                try:
+                    threading.Thread(target=read, daemon=True).start()
+                except Exception as e:
+                    # 起不了线程（线上典型是线程/内存耗尽）：_capturing 是我们
+                    # 在 UI 线程置的位，这里必须自己复位，否则后续所有截图都会
+                    # 卡在"上一次截图还没收尾"，会话也永远释放不掉
+                    with self._lock:
+                        if self._cap_gen == gen:
+                            self._capturing = False
+                    result['err'] = '起读帧线程失败：%s' % e
+                    done.set()
             except Exception as e:
                 result['err'] = str(e)
                 done.set()
 
-        start()
+        if not self._ui_call(start):
+            # 派发失败没人会 set done，直接给出真实原因，别干等 15 秒
+            raise RuntimeError('截图失败：无法把取帧任务投递到主线程')
         done.wait(15)
         if result.get('ok'):
             return True
